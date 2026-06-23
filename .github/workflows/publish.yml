@@ -23,24 +23,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p packages
-          gh release download "${{ inputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "*.nupkg" \
-            --dir packages
-          gh release download "${{ inputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "*.snupkg" \
-            --dir packages
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Pack from tag
+        run: dotnet pack src/Orleans.EventSourcing.Kurrent/Orleans.EventSourcing.Kurrent.csproj --configuration Release --output packages
             
       - name: NuGet login (OIDC → temp API key)
         uses: NuGet/login@v1
