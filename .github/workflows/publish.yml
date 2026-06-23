@@ -36,8 +36,14 @@ jobs:
             8.0.x
             10.0.x
 
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
       - name: Pack from tag
-        run: dotnet pack src/Orleans.EventSourcing.Kurrent/Orleans.EventSourcing.Kurrent.csproj --configuration Release --output packages
+        run: dotnet pack src/Orleans.EventSourcing.Kurrent/Orleans.EventSourcing.Kurrent.csproj --configuration Release --no-build --output packages
             
       - name: NuGet login (OIDC → temp API key)
         uses: NuGet/login@v1
