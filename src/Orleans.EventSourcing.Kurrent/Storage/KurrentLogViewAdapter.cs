@@ -1,4 +1,5 @@
 using KurrentDB.Client;
+using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Observability;
 
 using Orleans.Storage;
@@ -10,6 +11,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 {
     readonly ILogViewAdaptorHost<TLogView, TLogEntry> host;
     readonly CommandContext context;
+    readonly KurrentRetryOptions retryOptions;
     readonly CancellationTokenSource disposeCts = new();
 
     // Grain-side state. Only mutated from the grain's scheduler; all Kurrent I/O runs on the
@@ -21,9 +23,10 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     bool writeRejected;
     bool disposed;
 
-    public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider)
+    public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider, KurrentRetryOptions retryOptions)
     {
         this.host = host;
+        this.retryOptions = retryOptions;
         this.context = new CommandContext
         {
             Client = client,
@@ -114,7 +117,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         try
         {
-            var readResult = await context.Client.ReadStreamAsync(Direction.Forwards, context.StreamName, fromVersion.ToStreamPosition(), maxCount, false, CancellationToken.None)
+            var readResult = await KurrentRetry.ExecuteAsync(retryOptions, ct => context.Client.ReadStreamAsync(Direction.Forwards, context.StreamName, fromVersion.ToStreamPosition(), maxCount, false, ct), CancellationToken.None)
                                                  .ConfigureAwait(false);
 
             var result = new List<TLogEntry>();
@@ -267,7 +270,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         try
         {
             ThrowIfStreamFaulted();
-            success = await AppendAsync(context, batch, expectedVersion, disposeCts.Token).ConfigureAwait(true);
+            success = await KurrentRetry.ExecuteAsync(retryOptions, ct => AppendAsync(context, batch, expectedVersion, ct), disposeCts.Token).ConfigureAwait(true);
         }
         catch (OperationCanceledException)
         {
@@ -331,7 +334,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         await previous.ConfigureAwait(true); // never faults
 
         disposeCts.Token.ThrowIfCancellationRequested();
-        var result = await LoadAsync(context, disposeCts.Token).ConfigureAwait(true);
+        var result = await KurrentRetry.ExecuteAsync(retryOptions, ct => LoadAsync(context, ct), disposeCts.Token).ConfigureAwait(true);
         streamFault = null;
         writeRejected = false;
         return result;
@@ -354,7 +357,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         if (expectedVersion > 0)
         {
-            _ = await context.Client.TombstoneStreamAsync(context.StreamName, expectedVersion.ToStreamState(), linked.Token).ConfigureAwait(true);
+            _ = await KurrentRetry.ExecuteAsync(retryOptions, ct => context.Client.TombstoneStreamAsync(context.StreamName, expectedVersion.ToStreamState(), ct), linked.Token).ConfigureAwait(true);
         }
 
         // The stream is gone; there is nothing left to be inconsistent with.
@@ -541,7 +544,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     /// healing unset $tb metadata. Builds two identical views so the adapter does not need a
     /// deep copier for <typeparamref name="TLogView"/>.
     /// </summary>
-    private static async Task<LoadResult> LoadAsync(CommandContext context, CancellationToken token)
+    private static async ValueTask<LoadResult> LoadAsync(CommandContext context, CancellationToken token)
     {
         var confirmedView = new TLogView();
         var tentativeView = new TLogView();

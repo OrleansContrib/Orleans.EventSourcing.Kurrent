@@ -27,4 +27,9 @@ public sealed class KurrentStorageOptions : IStorageProviderSerializerOptions
     ///     Replace with a custom <see cref="IKurrentStreamNameProvider"/> to change the naming scheme.
     /// </summary>
     public IKurrentStreamNameProvider StreamNameProvider { get; set; } = new KurrentStreamName();
+
+    /// <summary>
+    ///     Controls how transient failures such as a cluster leadership election are retried.
+    /// </summary>
+    public KurrentRetryOptions Retry { get; set; } = new();
 }

@@ -27,7 +27,7 @@ internal sealed class LogConsistencyProvider : ILogViewAdaptorFactory
         where TLogEntry : class
     {
         ArgumentNullException.ThrowIfNull(services);
-        return new KurrentLogViewAdapter<TLogView, TLogEntry>(hostGrain, client, eventSerializer.GetEventConverter<TLogEntry>(), services, options.StreamNameProvider);
+        return new KurrentLogViewAdapter<TLogView, TLogEntry>(hostGrain, client, eventSerializer.GetEventConverter<TLogEntry>(), services, options.StreamNameProvider, options.Retry);
     }
 
     /// <inheritdoc />
