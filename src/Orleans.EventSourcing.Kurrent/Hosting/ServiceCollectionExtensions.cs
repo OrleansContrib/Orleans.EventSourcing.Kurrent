@@ -40,7 +40,7 @@ internal static class ServiceCollectionExtensions
         services.TryAddKeyedSingleton<IGrainEventProvider>(name, (sp, _) =>
         {
             var options = sp.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name);
-            return ActivatorUtilities.CreateInstance<KurrentGrainEventProvider>(sp, sp.GetRequiredKeyedService<IKurrentClient>(name), sp.GetRequiredKeyedService<IEventConverterFactory>(name), options.StreamNameProvider);
+            return ActivatorUtilities.CreateInstance<KurrentGrainEventProvider>(sp, sp.GetRequiredKeyedService<IKurrentClient>(name), sp.GetRequiredKeyedService<IEventConverterFactory>(name), options.StreamNameProvider, options.Retry);
         });
 
         return services;
@@ -58,7 +58,7 @@ internal static class ServiceCollectionExtensions
             var client = sp.GetRequiredKeyedService<IKurrentClient>(name);
             var eventSerializer = sp.GetRequiredKeyedService<IEventConverterFactory>(name);
             var options = sp.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name);
-            return ActivatorUtilities.CreateInstance<KurrentGrainStorageProvider>(sp, client, eventSerializer, options.StreamNameProvider);
+            return ActivatorUtilities.CreateInstance<KurrentGrainStorageProvider>(sp, client, eventSerializer, options.StreamNameProvider, options.Retry);
         });
 
         // Configure log view adaptor.

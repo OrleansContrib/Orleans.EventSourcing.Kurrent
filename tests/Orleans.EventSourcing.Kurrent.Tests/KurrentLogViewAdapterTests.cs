@@ -227,7 +227,8 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                    client,
                    serializer ?? new TestEventSerializer(),
                    services,
-                   streamNameProvider);
+                   streamNameProvider,
+                   new Configuration.KurrentRetryOptions());
 
         private sealed class TestLogViewAdaptorHost : ILogViewAdaptorHost<TestView, TestLogEntry>
         {

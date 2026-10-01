@@ -266,6 +266,28 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 | `ClientSettings` | `KurrentDBClientSettings` used to build the underlying `KurrentClient`. |
 | `GrainStorageSerializer` | Orleans' `IGrainStorageSerializer` used by the default event serializer. |
 | `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `KurrentStreamName.Default`. |
+| `Retry` | `KurrentRetryOptions` controlling how transient failures are retried. See below. |
+
+### Retrying transient failures
+
+Kurrent operations that fail with `NotLeaderException` or a gRPC `Unavailable` status (typically during a cluster leadership election) are retried with exponential backoff and jitter. This covers appends, reads, state reads/writes/deletes, stream tombstones, and catch-up subscriptions (which resubscribe from the last position seen). Any other exception is not retried.
+
+| `Retry` property | Default | Description |
+| --- | --- | --- |
+| `MaxAttempts` | `8` | Maximum attempts including the first. `1` disables retries. For subscriptions this is the number of consecutive failed attempts before the failure is surfaced; it resets whenever a message is received. |
+| `BaseDelay` | `100ms` | Delay before the first retry; doubles on each subsequent attempt. |
+| `MaxDelay` | `5s` | Upper bound on the delay between attempts. |
+
+```csharp
+siloBuilder.AddKurrentBasedLogConsistencyProviderAsDefault(o =>
+{
+    o.ClientSettings = settings;
+    o.Retry.MaxAttempts = 4;
+    o.Retry.MaxDelay = TimeSpan.FromSeconds(2);
+});
+```
+
+Retried appends are conditional on the expected stream version, so an append that actually committed before the failure surfaces as a version mismatch rather than a duplicate event.
 
 ### Custom event stream naming
 

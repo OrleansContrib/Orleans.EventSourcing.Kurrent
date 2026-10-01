@@ -5,6 +5,7 @@ using KurrentDB.Client;
 
 using Orleans.Storage;
 
+using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Observability;
 
 namespace Orleans.EventSourcing.Kurrent.Storage;
@@ -12,7 +13,7 @@ namespace Orleans.EventSourcing.Kurrent.Storage;
 /// <summary>
 ///      Kurrent-based log consistent storage provider.
 /// </summary>
-internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, IEventConverterFactory eventSerializer, IKurrentStreamNameProvider streamNameProvider) : IGrainStorage
+internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, IEventConverterFactory eventSerializer, IKurrentStreamNameProvider streamNameProvider, KurrentRetryOptions retryOptions) : IGrainStorage
 {
     private static StreamState ConvertETagToStreamState(string? eTag)
     {
@@ -48,7 +49,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             {
                 try
                 {
-                    _ = await kurrentClient.DeleteStreamAsync(streamNameProvider.GetStreamName(stateName, grainId), streamState, CancellationToken.None).ConfigureAwait(false);
+                    _ = await KurrentRetry.ExecuteAsync(retryOptions, ct => kurrentClient.DeleteStreamAsync(streamNameProvider.GetStreamName(stateName, grainId), streamState, ct), CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -73,12 +74,12 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
         };
         try
         {
-            var readResult = await kurrentClient.ReadStreamAsync(Direction.Backwards,
-                                                                  streamNameProvider.GetStreamName(stateName, grainId),
-                                                                  StreamPosition.End,
-                                                                  2,
-                                                                  false,
-                                                                  CancellationToken.None).ConfigureAwait(false);
+            var readResult = await KurrentRetry.ExecuteAsync(retryOptions, ct => kurrentClient.ReadStreamAsync(Direction.Backwards,
+                                                                   streamNameProvider.GetStreamName(stateName, grainId),
+                                                                   StreamPosition.End,
+                                                                   2,
+                                                                   false,
+                                                                   ct), CancellationToken.None).ConfigureAwait(false);
 
             var enumerator = readResult.GetAsyncEnumerator();
             try
@@ -157,10 +158,10 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             var eventRecord = eventSerializer.GetEventConverter<T>().SerializeEvent(grainState.State);
             Metrics.StateSerializationLatency.Record(sw.ElapsedMilliseconds, observabilityTags);
 
-            var result = await kurrentClient.ConditionalAppendToStreamAsync(streamName,
+            var result = await KurrentRetry.ExecuteAsync(retryOptions, ct => kurrentClient.ConditionalAppendToStreamAsync(streamName,
                                                                             expectedStreamState,
                                                                             [eventRecord],
-                                                                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                                                                            cancellationToken: ct), CancellationToken.None).ConfigureAwait(false);
 
             switch (result.Status)
             {

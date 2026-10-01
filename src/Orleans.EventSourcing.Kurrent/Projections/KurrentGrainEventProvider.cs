@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging;
 using Orleans.Metadata;
 using Orleans.Serialization.TypeSystem;
 
+using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Observability;
 using Orleans.EventSourcing.Kurrent.Storage;
 using System.Collections.Immutable;
@@ -16,7 +17,7 @@ using System.Collections.Immutable;
 
 namespace Orleans.EventSourcing.Kurrent.Projections;
 
-internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grainInterfaceTypeResolver, GrainInterfaceTypeToGrainTypeResolver grainInterfaceTypeToGrainTypeResolver, TypeConverter typeConverter, IKurrentClient kurrentClient, IEventConverterFactory eventSerializerFactory, IKurrentStreamNameProvider streamNameProvider, ILogger<KurrentGrainEventProvider> logger) : IGrainEventProvider
+internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grainInterfaceTypeResolver, GrainInterfaceTypeToGrainTypeResolver grainInterfaceTypeToGrainTypeResolver, TypeConverter typeConverter, IKurrentClient kurrentClient, IEventConverterFactory eventSerializerFactory, IKurrentStreamNameProvider streamNameProvider, KurrentRetryOptions retryOptions, ILogger<KurrentGrainEventProvider> logger) : IGrainEventProvider
 {
     const uint ALL_STREAM_CHECKPOINT_INTERVAL = 10_000; // The interval of AllStreamCheckpointReached
 
@@ -66,73 +67,112 @@ internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grain
         logger.Subscribe(subscriber, startingPosition, eventFilter);
         Metrics.CatchUpLive.Record(0, observabilityTags);
 
-        await foreach (var message in kurrentClient.CatchUpSubscription(startingPosition.ToAllPosition(), eventFilter, ALL_STREAM_CHECKPOINT_INTERVAL, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(true))
+        var resumeFrom = startingPosition.ToAllPosition();
+        var attempt = 0;
+
+        while (true)
         {
-            switch (message)
+            var enumerator = kurrentClient.CatchUpSubscription(resumeFrom, eventFilter, ALL_STREAM_CHECKPOINT_INTERVAL, cancellationToken).GetAsyncEnumerator(cancellationToken);
+            try
             {
-                case StreamMessage.Event eventMessage:
-
-                    var grainId = streamNameProvider.GetGrainId(eventMessage.ResolvedEvent.OriginalStreamId);
-
-                    if (eventSerializer is not null)
+                while (true)
+                {
+                    StreamMessage message;
+                    try
                     {
-                        TagList eventTags = new();
-                        foreach (var tag in observabilityTags)
+                        if (!await enumerator.MoveNextAsync().ConfigureAwait(true))
                         {
-                            eventTags.Add(tag);
+                            yield break;
                         }
-                        eventTags.Add("EventType", eventMessage.ResolvedEvent.Event.EventType);
 
-                        var stopwatch = Stopwatch.StartNew();
-                        var deserializedEvent = eventSerializer.DeserializeEvent(eventMessage.ResolvedEvent);
-                        Metrics.EventDeserializationLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
-
-                        logger.EventReceived(subscriber, eventMessage.ResolvedEvent.OriginalPosition, grainId, eventMessage.ResolvedEvent.OriginalEventNumber, deserializedEvent);
-                        Metrics.CatchupEventsProcessed.Add(1, eventTags);
-                        stopwatch.Restart();
-                        yield return new GrainEvent<TEventBase>(eventMessage.ResolvedEvent.OriginalPosition!.Value.ToGlobalEventLogPosition(), deserializedEvent.Event, grainId, eventMessage.ResolvedEvent.OriginalEventNumber.ToVersion(), deserializedEvent.EventId, deserializedEvent.Metadata?.AsReadOnly() ?? (IReadOnlyDictionary<string,string>)ImmutableDictionary<string,string>.Empty);
-                        Metrics.CatchupEventYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                        message = enumerator.Current;
+                        attempt = 0;
                     }
-                    else
+                    catch (Exception ex) when (KurrentRetry.IsTransient(ex) && !cancellationToken.IsCancellationRequested && attempt + 1 < retryOptions.MaxAttempts)
                     {
-                        TagList eventTags = new();
-                        foreach (var tag in observabilityTags)
-                        {
-                            eventTags.Add(tag);
-                        }
-                        eventTags.Add("EventType", eventMessage.ResolvedEvent.Event.EventType);
-                        logger.EventNotificationReceived(subscriber, eventMessage.ResolvedEvent.OriginalPosition, grainId, eventMessage.ResolvedEvent.OriginalEventNumber);
-                        Metrics.CatchUpNotificationsProcessed.Add(1, eventTags);
-
-                        var stopwatch = Stopwatch.StartNew();
-                        yield return new GrainEventNotification(eventMessage.ResolvedEvent.OriginalPosition!.Value.ToGlobalEventLogPosition(), grainId, eventMessage.ResolvedEvent.OriginalEventNumber.ToVersion(), eventMessage.ResolvedEvent.Event.EventId.ToGuid());
-                        Metrics.CatchupNotificationYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                        break; // subscription dropped (e.g. leader change): resubscribe from the last seen position
                     }
-                    break;
-                case StreamMessage.AllStreamCheckpointReached checkpoint:
 
-                    logger.Checkpoint(subscriber, checkpoint.Position);
-                    Metrics.CatchUpCheckpoints.Add(1, observabilityTags);
+                    switch (message)
+                    {
+                        case StreamMessage.Event eventMessage:
 
-                    var checkpointYieldTime = Stopwatch.StartNew();
-                    yield return new Checkpoint(checkpoint.Position.ToGlobalEventLogPosition());
-                    Metrics.CatchupCheckpointYieldLatency.Record(checkpointYieldTime.ElapsedMilliseconds, observabilityTags);
-                    break;
-                case StreamMessage.CaughtUp:
+                            if (eventMessage.ResolvedEvent.OriginalPosition is { } eventPosition)
+                            {
+                                resumeFrom = FromAll.After(eventPosition);
+                            }
 
-                    logger.SubscriptionCaughtUp(subscriber);
-                    Metrics.CatchUpLive.Record(1, observabilityTags);
+                            var grainId = streamNameProvider.GetGrainId(eventMessage.ResolvedEvent.OriginalStreamId);
 
-                    yield return CaughtUp.Instance;
-                    break;
-                case StreamMessage.FellBehind:
+                            if (eventSerializer is not null)
+                            {
+                                TagList eventTags = new();
+                                foreach (var tag in observabilityTags)
+                                {
+                                    eventTags.Add(tag);
+                                }
+                                eventTags.Add("EventType", eventMessage.ResolvedEvent.Event.EventType);
 
-                    logger.SubscriptionFellBehind(subscriber);
-                    Metrics.CatchUpLive.Record(0, observabilityTags);
+                                var stopwatch = Stopwatch.StartNew();
+                                var deserializedEvent = eventSerializer.DeserializeEvent(eventMessage.ResolvedEvent);
+                                Metrics.EventDeserializationLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
 
-                    yield return FallenBehind.Instance;
-                    break;
+                                logger.EventReceived(subscriber, eventMessage.ResolvedEvent.OriginalPosition, grainId, eventMessage.ResolvedEvent.OriginalEventNumber, deserializedEvent);
+                                Metrics.CatchupEventsProcessed.Add(1, eventTags);
+                                stopwatch.Restart();
+                                yield return new GrainEvent<TEventBase>(eventMessage.ResolvedEvent.OriginalPosition!.Value.ToGlobalEventLogPosition(), deserializedEvent.Event, grainId, eventMessage.ResolvedEvent.OriginalEventNumber.ToVersion(), deserializedEvent.EventId, deserializedEvent.Metadata?.AsReadOnly() ?? (IReadOnlyDictionary<string,string>)ImmutableDictionary<string,string>.Empty);
+                                Metrics.CatchupEventYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                            }
+                            else
+                            {
+                                TagList eventTags = new();
+                                foreach (var tag in observabilityTags)
+                                {
+                                    eventTags.Add(tag);
+                                }
+                                eventTags.Add("EventType", eventMessage.ResolvedEvent.Event.EventType);
+                                logger.EventNotificationReceived(subscriber, eventMessage.ResolvedEvent.OriginalPosition, grainId, eventMessage.ResolvedEvent.OriginalEventNumber);
+                                Metrics.CatchUpNotificationsProcessed.Add(1, eventTags);
+
+                                var stopwatch = Stopwatch.StartNew();
+                                yield return new GrainEventNotification(eventMessage.ResolvedEvent.OriginalPosition!.Value.ToGlobalEventLogPosition(), grainId, eventMessage.ResolvedEvent.OriginalEventNumber.ToVersion(), eventMessage.ResolvedEvent.Event.EventId.ToGuid());
+                                Metrics.CatchupNotificationYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                            }
+                            break;
+                        case StreamMessage.AllStreamCheckpointReached checkpoint:
+
+                            resumeFrom = FromAll.After(checkpoint.Position);
+
+                            logger.Checkpoint(subscriber, checkpoint.Position);
+                            Metrics.CatchUpCheckpoints.Add(1, observabilityTags);
+
+                            var checkpointYieldTime = Stopwatch.StartNew();
+                            yield return new Checkpoint(checkpoint.Position.ToGlobalEventLogPosition());
+                            Metrics.CatchupCheckpointYieldLatency.Record(checkpointYieldTime.ElapsedMilliseconds, observabilityTags);
+                            break;
+                        case StreamMessage.CaughtUp:
+
+                            logger.SubscriptionCaughtUp(subscriber);
+                            Metrics.CatchUpLive.Record(1, observabilityTags);
+
+                            yield return CaughtUp.Instance;
+                            break;
+                        case StreamMessage.FellBehind:
+
+                            logger.SubscriptionFellBehind(subscriber);
+                            Metrics.CatchUpLive.Record(0, observabilityTags);
+
+                            yield return FallenBehind.Instance;
+                            break;
+                    }
+                }
             }
+            finally
+            {
+                await enumerator.DisposeAsync().ConfigureAwait(true);
+            }
+
+            await Task.Delay(KurrentRetry.GetDelay(retryOptions, ++attempt), cancellationToken).ConfigureAwait(true);
         }
     }
 
