@@ -1,5 +1,7 @@
 using System.Buffers;
+using System.Globalization;
 using System.Text;
+using System.Text.Json;
 
 using KurrentDB.Client;
 
@@ -121,5 +123,75 @@ internal static class TestExtensions
             events.Add(resolvedEvent);
         }
         return events;
+    }
+}
+
+/// <summary>
+/// Chooses between the in-memory emulator (the default) and a real KurrentDB server.
+/// </summary>
+/// <remarks>
+/// Set the <c>KURRENT_JOURNALING_TESTS_CONNECTION_STRING</c> environment variable (for example
+/// <c>kurrentdb://localhost:2113?tls=false</c>) to run the tests against that server instead of the emulator.
+/// </remarks>
+internal static class TestKurrent
+{
+    public const string ConnectionStringVariable = "KURRENT_JOURNALING_TESTS_CONNECTION_STRING";
+
+    private static readonly KurrentDBClientSettings? RealServerSettings
+        = Environment.GetEnvironmentVariable(ConnectionStringVariable) is { Length: > 0 } connectionString
+            ? KurrentDBClientSettings.Create(connectionString)
+            : null;
+
+    public static bool UseRealKurrent => RealServerSettings is not null;
+
+    /// <summary>The settings the silo uses: the real server, or the address that selects the emulator.</summary>
+    public static KurrentDBClientSettings ClientSettings
+        => RealServerSettings ?? KurrentDBClientSettings.Create("esdb://kurrentemulator:2113?tls=false");
+
+    /// <summary>Reads the real server's version from its HTTP <c>/info</c> endpoint.</summary>
+    public static async Task<Version> GetServerVersionAsync()
+    {
+        using var http = new HttpClient { BaseAddress = ClientSettings.ConnectivitySettings.Address };
+        using var info = JsonDocument.Parse(await http.GetStringAsync("/info"));
+
+        // EventStoreDB reports esVersion; KurrentDB reports both, e.g. "25.1.4.3194-None".
+        var version = info.RootElement.GetProperty("esVersion").GetString()!;
+        return Version.Parse(version.Split('-')[0]);
+    }
+
+    /// <summary>Returns the server's <c>MaxAppendSize</c>, from its HTTP <c>/info/options</c> endpoint for a real server.</summary>
+    public static async Task<long> GetMaxAppendSizeAsync(IKurrentClient client)
+    {
+        if (client is InMemoryKurrentClient emulator)
+        {
+            return emulator.MaxAppendSize;
+        }
+
+        using var http = new HttpClient { BaseAddress = ClientSettings.ConnectivitySettings.Address };
+        using var options = JsonDocument.Parse(await http.GetStringAsync("/info/options"));
+        var option = options.RootElement.EnumerateArray().Single(x => x.GetProperty("name").GetString() == "MaxAppendSize");
+        return long.Parse(option.GetProperty("value").GetString()!, CultureInfo.InvariantCulture);
+    }
+
+    public static IKurrentClient CreateClient()
+        => RealServerSettings is { } settings ? new KurrentClient(settings) : new InMemoryKurrentClient();
+
+    /// <summary>
+    /// Makes the emulator behave like a server with or without multi-stream appends. A real server's support is
+    /// fixed by its version, so the test is skipped when it does not match.
+    /// </summary>
+    public static async Task RequireMultiStreamAppendAsync(IKurrentClient client, bool supported)
+    {
+        if (client is InMemoryKurrentClient emulator)
+        {
+            emulator.MultiStreamAppendSupported = supported;
+            return;
+        }
+
+        var actual = await client.SupportsMultiStreamAppendAsync(CancellationToken.None);
+        Assert.SkipUnless(actual == supported,
+                          supported
+                              ? "Needs a server with multi-stream appends (KurrentDB 25.1+)."
+                              : "Needs a server without multi-stream appends (older than KurrentDB 25.1).");
     }
 }

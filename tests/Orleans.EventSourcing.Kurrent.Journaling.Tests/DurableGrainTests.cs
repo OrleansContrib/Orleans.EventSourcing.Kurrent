@@ -55,7 +55,7 @@ public sealed class DurableGrainTests : IAsyncLifetime
         builder.ConfigureSilo((_, silo) =>
             silo.AddKurrentJournalStorageAsDefault(options =>
                 {
-                    options.ClientSettings = KurrentDBClientSettings.Create("esdb://kurrentemulator:2113?tls=false");
+                    options.ClientSettings = TestKurrent.ClientSettings;
                     options.CompactionEventCountThreshold = CompactionEventCountThreshold;
                 })
                 .UseJsonJournalFormat(CartJournalJsonContext.Default));
@@ -88,7 +88,8 @@ public sealed class DurableGrainTests : IAsyncLifetime
             await cart.SetItem($"item-{i % 4}", i);
         }
 
-        var kurrent = InMemoryKurrentClient.Get(Providers.ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME);
+        // The same client the silo uses: the shared emulator instance, or a new connection to the real server.
+        await using var kurrent = KurrentClientFactory.Create(TestKurrent.ClientSettings, Providers.ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME);
         var streamName = KurrentJournalStorageOptions.DefaultGetStreamName(JournalId.FromGrainId(cart.GetGrainId()));
         var events = await kurrent.ReadVisibleEventsAsync(streamName);
 

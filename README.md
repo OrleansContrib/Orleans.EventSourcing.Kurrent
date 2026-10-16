@@ -317,9 +317,21 @@ On KurrentDB 25.1 and later, compaction writes the snapshot and the `$tb` metada
 
 The account the provider connects with needs write access to the journal streams' metastreams, as it does for any stream metadata change.
 
+### Testing against a real server
+
+The journaling tests use the in-memory emulator by default. To run them against a real server, set `KURRENT_JOURNALING_TESTS_CONNECTION_STRING`, for example:
+
+```bash
+docker run -d -p 2113:2113 -e KURRENTDB_INSECURE=true -e KURRENTDB_MAX_APPEND_SIZE=1048576 -e KURRENTDB_MAX_APPEND_EVENT_SIZE=1048576 docker.kurrent.io/kurrent-latest/kurrentdb:25.1
+KURRENT_JOURNALING_TESTS_CONNECTION_STRING="kurrentdb://localhost:2113?tls=false" dotnet test tests/Orleans.EventSourcing.Kurrent.Journaling.Tests
+```
+
+A server's support for multi-stream appends depends on its version, so tests that need a server with (25.1+) or without it are skipped on the other kind. The `MaxAppendSize` test is skipped when the server's limit is above 16 MiB, as it is by default from 25.1; the command above lowers it to 1 MiB.
+
 ### Limitations
 
-- Every write must fit within the server's `MaxAppendSize` (1 MiB by default), including whole snapshots. Raise `MaxAppendSize` on the server if your durable state is larger.
+- Every write must fit within the server's `MaxAppendSize`, including whole snapshots. It defaults to 1 MiB before KurrentDB 25.1 and to 256 MiB from 25.1, which also limits each event to `MaxAppendEventSize` (16 MiB; keep `MaxEventSize` below it). Raise `MaxAppendSize` on the server if your durable state is larger. An append over the limit fails with `MaximumAppendSizeExceededException`. An atomic compaction over the limit fails with an `RpcException` (`ResourceExhausted`). On .NET 8 that compaction can stall instead, and it then fails with `DeadlineExceeded` after the client's `DefaultDeadline` (10 seconds by default).
+- KurrentDB.Client 1.2.0 sends multi-stream appends without a deadline and replaces their transport errors with a `NullReferenceException`. The provider applies `ClientSettings.DefaultDeadline` to them and rethrows the original `RpcException`.
 - In Orleans 10.4, grain durable state always uses the default journal storage provider. Named providers (`AddKurrentJournalStorage("name", ...)`) are reachable through the keyed `IJournaledStateManagerFactory`.
 - Journal metadata operations (`GetMetadataAsync`, `UpdateMetadataAsync`, `CreateIfNotExistsAsync`) and journal catalog listing (`IJournalStorageCatalog`) are not implemented yet. Orleans' state manager does not use them.
 

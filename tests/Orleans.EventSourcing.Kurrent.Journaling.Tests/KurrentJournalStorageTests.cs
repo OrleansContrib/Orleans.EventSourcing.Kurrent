@@ -1,5 +1,7 @@
 using System.Text.Json;
 
+using Grpc.Core;
+
 using KurrentDB.Client;
 
 using Orleans.EventSourcing.Kurrent.Storage;
@@ -7,10 +9,12 @@ using Orleans.Storage;
 
 namespace Orleans.EventSourcing.Kurrent.Journaling.Tests;
 
-public sealed class KurrentJournalStorageTests
+public sealed class KurrentJournalStorageTests : IAsyncDisposable
 {
-    private readonly InMemoryKurrentClient kurrent = new();
+    private readonly IKurrentClient kurrent = TestKurrent.CreateClient();
     private readonly string streamName = $"orleansjournal-test/{Guid.NewGuid():N}";
+
+    public ValueTask DisposeAsync() => kurrent.DisposeAsync();
 
     [Fact]
     public async Task ReadOfMissingJournalCompletesWithoutData()
@@ -66,6 +70,7 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public async Task AtomicCompactionWritesSnapshotAndTruncationTogether()
     {
+        await TestKurrent.RequireMultiStreamAppendAsync(kurrent, supported: true);
         var client = new InterceptingKurrentClient(kurrent);
         var storage = TestExtensions.CreateStorage(client, streamName);
         await CollectingConsumer.ReadAsync(storage);
@@ -113,6 +118,7 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public async Task AtomicCompactionRetriesWhenMetadataChangesConcurrently()
     {
+        await TestKurrent.RequireMultiStreamAppendAsync(kurrent, supported: true);
         var client = new InterceptingKurrentClient(kurrent);
         var storage = TestExtensions.CreateStorage(client, streamName);
         await CollectingConsumer.ReadAsync(storage);
@@ -132,7 +138,7 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public async Task CompactionFallsBackToSeparateMetadataWriteWhenServerLacksMultiStreamAppend()
     {
-        kurrent.MultiStreamAppendSupported = false;
+        await TestKurrent.RequireMultiStreamAppendAsync(kurrent, supported: false);
         var client = new InterceptingKurrentClient(kurrent);
         var storage = TestExtensions.CreateStorage(client, streamName);
         await CollectingConsumer.ReadAsync(storage);
@@ -163,7 +169,7 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public async Task RequiredAtomicCompactionFailsWhenServerLacksMultiStreamAppend()
     {
-        kurrent.MultiStreamAppendSupported = false;
+        await TestKurrent.RequireMultiStreamAppendAsync(kurrent, supported: false);
         var storage = TestExtensions.CreateStorage(kurrent, streamName, new KurrentJournalStorageOptions { AtomicCompaction = AtomicCompactionMode.Required });
         await CollectingConsumer.ReadAsync(storage);
         await storage.AppendAsync("a;");
@@ -174,9 +180,9 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public async Task RecoveryIgnoresEventsBeforeSnapshotWhenTruncationFailed()
     {
-        kurrent.MultiStreamAppendSupported = false;
+        // Disabling atomic compaction forces the separate metadata write on any server.
         var client = new InterceptingKurrentClient(kurrent) { ThrowOnSetStreamMetadata = new InvalidOperationException("metadata write failed") };
-        var storage = TestExtensions.CreateStorage(client, streamName);
+        var storage = TestExtensions.CreateStorage(client, streamName, new KurrentJournalStorageOptions { AtomicCompaction = AtomicCompactionMode.Disabled });
         await CollectingConsumer.ReadAsync(storage);
         await storage.AppendAsync("a;");
         await storage.AppendAsync("b;");
@@ -207,6 +213,7 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public async Task ConcurrentWriterCausesInconsistentStateOnAtomicCompaction()
     {
+        await TestKurrent.RequireMultiStreamAppendAsync(kurrent, supported: true);
         var first = TestExtensions.CreateStorage(kurrent, streamName);
         await CollectingConsumer.ReadAsync(first);
         await first.AppendAsync("a;");
@@ -295,4 +302,63 @@ public sealed class KurrentJournalStorageTests
     [Fact]
     public void SystemStreamNamesAreRejected()
         => Assert.Throws<ArgumentException>(() => TestExtensions.CreateStorage(kurrent, "$system"));
+
+    [Fact]
+    public async Task MultiStreamAppendSupportMatchesServerVersion()
+    {
+        Assert.SkipUnless(TestKurrent.UseRealKurrent, "Needs a real server to compare with its version.");
+
+        var version = await TestKurrent.GetServerVersionAsync();
+
+        Assert.Equal(version >= new Version(25, 1), await kurrent.SupportsMultiStreamAppendAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task MetadataOnlyConflictInMultiStreamAppendNamesTheMetastream()
+    {
+        await TestKurrent.RequireMultiStreamAppendAsync(kurrent, supported: true);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var metastreamName = StreamMetadataJson.GetMetastreamName(streamName);
+        var written = await kurrent.ConditionalAppendToStreamAsync(streamName, StreamState.NoStream, [new EventData(Uuid.NewUuid(), "a", "{}"u8.ToArray())], cancellationToken);
+        await kurrent.SetStreamMetadata(streamName, StreamState.NoStream, new StreamMetadata(maxCount: 10), cancellationToken);
+
+        // The journal stream's expected state is right; only the metastream's is stale.
+        AppendStreamRequest[] requests =
+        [
+            new(streamName, written.NextExpectedStreamState, [new EventData(Uuid.NewUuid(), "b", "{}"u8.ToArray())]),
+            new(metastreamName, StreamState.NoStream, [StreamMetadataJson.CreateMetadataEvent(new StreamMetadata(maxCount: 20))]),
+        ];
+
+        var ex = await Assert.ThrowsAsync<WrongExpectedVersionException>(async () => await kurrent.MultiStreamAppendAsync(requests, cancellationToken));
+
+        Assert.Equal(metastreamName, ex.StreamName);
+        Assert.Single(await kurrent.ReadVisibleEventsAsync(streamName));
+        Assert.Equal(10, (await kurrent.GetStreamMetadata(streamName, cancellationToken)).Metadata.MaxCount);
+    }
+
+    [Fact]
+    public async Task AppendLargerThanServerMaxAppendSizeFails()
+    {
+        var maxAppendSize = await TestKurrent.GetMaxAppendSizeAsync(kurrent);
+        Assert.SkipWhen(maxAppendSize > 16 * 1024 * 1024,
+                        $"The server's MaxAppendSize of {maxAppendSize} bytes is too large to exceed in a test (KurrentDB 25.1+ defaults to 256 MiB); start it with KURRENTDB_MAX_APPEND_SIZE=1048576 and KURRENTDB_MAX_APPEND_EVENT_SIZE=1048576.");
+
+        var storage = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(storage);
+        await storage.AppendAsync("a;");
+
+        // Split into several events, but still one append over the server's MaxAppendSize.
+        var tooLarge = new string('x', checked((int)maxAppendSize + 512 * 1024));
+        await Assert.ThrowsAsync<MaximumAppendSizeExceededException>(async () => await storage.AppendAsync(tooLarge));
+
+        // A compaction is a single-stream append on servers without multi-stream appends. A multi-stream append
+        // fails at the server's gRPC message size limit, which has no specific exception; on .NET 8 the call can stall
+        // until the client's DefaultDeadline instead.
+        var ex = await Assert.ThrowsAnyAsync<Exception>(async () => await storage.ReplaceAsync(tooLarge));
+        Assert.True(ex is MaximumAppendSizeExceededException or RpcException { StatusCode: StatusCode.ResourceExhausted or StatusCode.DeadlineExceeded }, $"Unexpected exception: {ex}");
+
+        // Nothing was written, and the journal is still usable.
+        await storage.AppendAsync("b;");
+        Assert.Equal("a;b;", (await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName))).Text);
+    }
 }

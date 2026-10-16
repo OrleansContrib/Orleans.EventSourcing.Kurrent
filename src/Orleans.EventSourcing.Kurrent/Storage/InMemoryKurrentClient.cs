@@ -1,3 +1,5 @@
+using Grpc.Core;
+
 using KurrentDB.Client;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
@@ -119,6 +121,8 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
                 throw new StreamDeletedException(streamName);
             }
 
+            ThrowIfOverMaxAppendSize(eventData);
+
             var (streamState, isSoftDeleted) = GetStreamStateCore(streamName);
 
             // StreamState.Any means "no optimistic-concurrency check": accept the append regardless of the current revision.
@@ -192,6 +196,24 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
     /// </summary>
     internal bool MultiStreamAppendSupported { get; set; } = true;
 
+    /// <summary>
+    /// The server's <c>MaxAppendSize</c>: the most event data and metadata, in bytes, accepted in one append (or, in a
+    /// multi-stream append, for one stream). Defaults to 1 MiB, the default before KurrentDB 25.1 (which raised it to 256 MiB).
+    /// </summary>
+    internal int MaxAppendSize { get; set; } = 1024 * 1024;
+
+    // A real server rejects a single-stream append over MaxAppendSize with MaximumAppendSizeExceededException.
+    private void ThrowIfOverMaxAppendSize(IEnumerable<EventData> eventData)
+    {
+        if (GetAppendSize(eventData) > MaxAppendSize)
+        {
+            throw new MaximumAppendSizeExceededException(MaxAppendSize, null!);
+        }
+    }
+
+    private static long GetAppendSize(IEnumerable<EventData> eventData)
+        => eventData.Sum(x => (long)x.Data.Length + x.Metadata.Length);
+
     public ValueTask<bool> SupportsMultiStreamAppendAsync(CancellationToken cancellationToken)
         => ValueTask.FromResult(MultiStreamAppendSupported);
 
@@ -205,6 +227,13 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
         if (requests.Select(x => x.Stream).Distinct(StringComparer.Ordinal).Count() != requests.Count)
         {
             throw new ArgumentException("Each stream can only appear once in a multi-stream append.", nameof(requests));
+        }
+
+        // A real server's gRPC message limit rejects any one stream's request over MaxAppendSize, before any validation,
+        // with an RpcException that has no rich status (which KurrentClient rethrows in place of the client's NullReferenceException).
+        if (requests.Any(x => GetAppendSize(x.Messages) > MaxAppendSize))
+        {
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, "Received message exceeds the maximum configured message size."));
         }
 
         await singleAccess.WaitAsync(cancellationToken).ConfigureAwait(false);

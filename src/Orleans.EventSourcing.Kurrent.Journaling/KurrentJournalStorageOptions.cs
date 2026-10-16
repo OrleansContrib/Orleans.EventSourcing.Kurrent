@@ -60,8 +60,9 @@ public sealed class KurrentJournalStorageOptions
     ///     several events which are appended in one atomic operation.
     /// </summary>
     /// <remarks>
-    ///     Every write must still fit within the server's <c>MaxAppendSize</c> (1 MiB by default), which limits
-    ///     the total size of one append. Snapshots larger than that cannot be written.
+    ///     Every write must still fit within the server's <c>MaxAppendSize</c> (1 MiB by default before KurrentDB 25.1,
+    ///     256 MiB from 25.1), which limits the total size of one append. Snapshots larger than that cannot be written.
+    ///     From KurrentDB 25.1, each event must also fit within the server's <c>MaxAppendEventSize</c> (16 MiB by default).
     /// </remarks>
     public int MaxEventSize { get; set; } = DefaultMaxEventSize;
 

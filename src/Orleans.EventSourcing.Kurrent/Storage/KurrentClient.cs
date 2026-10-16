@@ -1,3 +1,8 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
+
+using Grpc.Core;
+
 using KurrentDB.Client;
 
 namespace Orleans.EventSourcing.Kurrent.Storage;
@@ -6,11 +11,18 @@ internal sealed class KurrentClient : IKurrentClient
 {
     private readonly KurrentDBClient client;
     private readonly Lazy<ServerCapabilitiesProbe> capabilitiesProbe;
+    private readonly TimeSpan? defaultDeadline;
+    private int disposed;
 
     public KurrentClient(KurrentDBClientSettings settings)
     {
         client = new(settings);
         capabilitiesProbe = new(() => new ServerCapabilitiesProbe(settings));
+
+        // Infinite or out-of-range deadlines mean no deadline, as they do for the client's own calls.
+        defaultDeadline = settings.DefaultDeadline is { } timeout && timeout > TimeSpan.Zero && timeout.TotalMilliseconds < int.MaxValue
+            ? timeout
+            : null;
     }
 
     public Task<IWriteResult> SetStreamMetadata(string streamName, StreamState expectedRevision, StreamMetadata streamMetadata, CancellationToken token)
@@ -86,11 +98,83 @@ internal sealed class KurrentClient : IKurrentClient
         return capabilities.SupportsMultiStreamAppend;
     }
 
-    public ValueTask<MultiStreamAppendResponse> MultiStreamAppendAsync(IReadOnlyList<AppendStreamRequest> requests, CancellationToken cancellationToken)
-        => client.MultiStreamAppendAsync(requests, cancellationToken);
+    public async ValueTask<MultiStreamAppendResponse> MultiStreamAppendAsync(IReadOnlyList<AppendStreamRequest> requests, CancellationToken cancellationToken)
+    {
+        // KurrentDB.Client 1.2.0 throws NullReferenceException instead of the server's error whenever a multi-stream
+        // append fails with an RpcException that carries no rich status, e.g. a request over the server's
+        // MaxAppendSize (ResourceExhausted), or Unavailable/DeadlineExceeded (fixed in KurrentDB.Client 1.4.0).
+        // Capture the RpcException as it is thrown, so that it can be rethrown in place of the NullReferenceException.
+        var thrown = new StrongBox<RpcException?>();
+        EnsureRpcExceptionCaptureRegistered();
+        capturedRpcException.Value = thrown;
 
+        // The client sends a multi-stream append as a streaming call, which gets no deadline, unlike a single-stream
+        // append, which gets DefaultDeadline. Apply DefaultDeadline here too. On .NET 8, a request over the server's
+        // MaxAppendSize can leave the call stuck writing its request stream, where it ignores cancellation, so stop
+        // waiting for it at the deadline as well as cancelling it.
+        using var deadline = defaultDeadline.HasValue ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+        deadline?.CancelAfter(defaultDeadline!.Value);
+        var append = client.MultiStreamAppendAsync(requests, deadline?.Token ?? cancellationToken).AsTask();
+        try
+        {
+            return await (defaultDeadline is { } timeout ? append.WaitAsync(timeout, cancellationToken) : append).ConfigureAwait(false);
+        }
+        catch (Exception ex) when ((ex is TimeoutException || deadline is { IsCancellationRequested: true }) && !cancellationToken.IsCancellationRequested)
+        {
+            if (deadline is not null)
+            {
+                await deadline.CancelAsync().ConfigureAwait(false);
+            }
+
+            ObserveAbandoned(append);
+            throw new RpcException(new Status(StatusCode.DeadlineExceeded, $"The multi-stream append did not complete within the client's DefaultDeadline of {defaultDeadline}.", ex));
+        }
+        catch (OperationCanceledException) when (!append.IsCompleted)
+        {
+            ObserveAbandoned(append);
+            throw;
+        }
+        catch (NullReferenceException) when (thrown.Value is { } rpcException)
+        {
+            ExceptionDispatchInfo.Throw(rpcException);
+            throw;
+        }
+        finally
+        {
+            capturedRpcException.Value = null;
+        }
+    }
+
+    // An append that is no longer awaited may still fail later; observe it so it is not an unobserved task exception.
+    private static void ObserveAbandoned(Task task)
+        => task.ContinueWith(static x => _ = x.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+    private static readonly AsyncLocal<StrongBox<RpcException?>?> capturedRpcException = new();
+    private static int rpcExceptionCaptureRegistered;
+
+    private static void EnsureRpcExceptionCaptureRegistered()
+    {
+        if (Interlocked.Exchange(ref rpcExceptionCaptureRegistered, 1) == 0)
+        {
+            AppDomain.CurrentDomain.FirstChanceException += static (_, e) =>
+            {
+                if (e.Exception is RpcException rpcException && capturedRpcException.Value is { } box)
+                {
+                    box.Value = rpcException;
+                }
+            };
+        }
+    }
+
+    // Disposal must be idempotent: DI can track the same instance under several registrations, and
+    // KurrentDBClient throws ObjectDisposedException when disposed twice.
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
         client.Dispose();
         if (capabilitiesProbe.IsValueCreated)
         {
@@ -100,6 +184,11 @@ internal sealed class KurrentClient : IKurrentClient
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
         await client.DisposeAsync().ConfigureAwait(false);
         if (capabilitiesProbe.IsValueCreated)
         {
