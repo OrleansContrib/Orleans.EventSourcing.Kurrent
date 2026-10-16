@@ -11,10 +11,12 @@
     <File Path="LICENSE.md" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/Orleans.EventSourcing.Kurrent.Journaling/Orleans.EventSourcing.Kurrent.Journaling.csproj" />
     <Project Path="src/Orleans.EventSourcing.Kurrent.Reminders/Orleans.EventSourcing.Kurrent.Reminders.csproj" />
     <Project Path="src/Orleans.EventSourcing.Kurrent/Orleans.EventSourcing.Kurrent.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Orleans.EventSourcing.Kurrent.Journaling.Tests/Orleans.EventSourcing.Kurrent.Journaling.Tests.csproj" />
     <Project Path="tests/Orleans.EventSourcing.Kurrent.Tests/Orleans.EventSourcing.Kurrent.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">

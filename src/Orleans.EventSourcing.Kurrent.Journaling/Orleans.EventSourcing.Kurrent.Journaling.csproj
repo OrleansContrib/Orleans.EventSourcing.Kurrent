@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <PackageId>Orleans.EventSourcing.Kurrent.Journaling</PackageId>
+    <Authors>William Gunaratne</Authors>
+    <Title>Kurrent Journaling Storage Provider for Microsoft Orleans</Title>
+    <Description>An Orleans Journaling (IJournalStorage) provider that stores durable grain state journals in KurrentDB streams.</Description>
+    <RootNamespace>Orleans.EventSourcing.Kurrent.Journaling</RootNamespace>
+    <AnalysisLevel>latest-all</AnalysisLevel>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Orleans Journaling is experimental; every use of its API raises ORLEANSEXP005. -->
+    <NoWarn>$(NoWarn);ORLEANSEXP005</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Orleans.EventSourcing.Kurrent.Journaling.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="KurrentDB.Client" />
+    <PackageReference Include="Microsoft.Orleans.Journaling" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Orleans.EventSourcing.Kurrent\Orleans.EventSourcing.Kurrent.csproj" />
+  </ItemGroup>
+
+  <!--
+    Microsoft.Orleans.Journaling is only published as a prerelease, and NuGet does not allow a stable package to depend
+    on a prerelease one. Mark this package as a prerelease until Journaling ships a stable version.
+  -->
+  <Target Name="MarkJournalingPackagePrerelease" AfterTargets="MinVer" Condition="'$(MinVerPreRelease)' == ''">
+    <PropertyGroup>
+      <PackageVersion>$(MinVerMajor).$(MinVerMinor).$(MinVerPatch)-alpha</PackageVersion>
+    </PropertyGroup>
+  </Target>
+</Project>

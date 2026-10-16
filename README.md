@@ -12,6 +12,7 @@ This project adds KurrentDB support to Microsoft Orleans.
 | **Log-consistency provider** (`AddKurrentBasedLogConsistencyProvider*`) | `ILogViewAdaptorFactory` for `JournaledGrain<TView, TEntry>` | The full **event log** for the grain — every `RaiseEvent` is appended to the grain's Kurrent stream. The view is rebuilt by replaying events. | Event-sourced grains (`JournaledGrain`). Gives you full history, projections via `IGrainEventProvider`, and replay. |
 | **Grain state storage provider** (`AddKurrentBasedGrainStorageProvider*`) | `IGrainStorage` for `Grain<TState>` / `[PersistentState]` | The **latest snapshot** only — each `WriteStateAsync` appends one event and Kurrent's `MaxCount = 1` stream metadata trims older revisions. | Regular Orleans state persistence when you want it backed by Kurrent (e.g. to keep all storage in one system) |
 | **Reminders provider** (`AddKurrentReminderService`) ⚠ experimental | `IReminderTable` | Grain Reminders | Use this provider to persist and manage Orleans reminders in KurrentDB. Installed from a separate package `Orleans.EventSourcing.Kurrent.Reminders`. |
+| **Journaling storage provider** (`AddKurrentJournalStorage*`) ⚠ experimental | `IJournalStorageProvider` for Orleans Journaling (`IDurableStateManager`, `DurableGrain`) | Each grain's durable state journal, compacted into snapshots with older events truncated. | Durable collections and values with Orleans Journaling. Installed from a separate prerelease package `Orleans.EventSourcing.Kurrent.Journaling`. |
 | **Grain event subscription** (`IGrainEventProvider`) ⚠ experimental | n/a | Read-side subscription to the Kurrent `$all` stream, filtered to the streams produced by the log-consistency provider. | Projections / read models built from grain events emitted via the log-consistency provider. |
 
 ## Install
@@ -24,6 +25,12 @@ The reminders provider is shipped as a separate package:
 
 ```sh
 dotnet add package Orleans.EventSourcing.Kurrent.Reminders
+```
+
+The Orleans Journaling storage provider is shipped as a separate prerelease package, because Orleans Journaling itself is only published as a prerelease (it requires Orleans 10.4):
+
+```sh
+dotnet add package Orleans.EventSourcing.Kurrent.Journaling --prerelease
 ```
 
 Targets `net8.0` and `net10.0`. Requires Microsoft Orleans 10.x and a KurrentDB / EventStoreDB server.
@@ -256,6 +263,65 @@ builder.UseOrleans(silo =>
 ```
 
 Reminders are persisted to a single stream. If you have high reminder churn, the stream will become large and it will take time to read the entire stream on startup.
+
+## Journaling storage provider - Experimental
+
+[Orleans Journaling](https://github.com/dotnet/orleans/tree/main/src/Orleans.Journaling) persists durable grain state (`IDurableStateManager`, `DurableGrain`, `IDurableDictionary`, `IDurableList`, `IDurableValue` and friends) as a journal of operations plus periodic snapshots. This provider stores each journal in its own KurrentDB stream. It ships as a **separate package** because Orleans Journaling is only published as a prerelease and requires Orleans 10.4:
+
+```sh
+dotnet add package Orleans.EventSourcing.Kurrent.Journaling --prerelease
+```
+
+Register it on the silo, together with the JSON metadata for your journaled types:
+
+```csharp
+using System.Text.Json.Serialization;
+using Orleans.EventSourcing.Kurrent.Journaling;
+using Orleans.Journaling.Json;
+
+builder.UseOrleans(silo =>
+{
+    silo.AddKurrentJournalStorageAsDefault(o => o.ClientSettings = settings)
+        .UseJsonJournalFormat(JournalJsonContext.Default);
+});
+
+// JSON journaling needs source-generated metadata for every journaled key, value and state type,
+// plus string, uint and DateTime, which Orleans uses to track state names and retirements.
+[JsonSerializable(typeof(string))]
+[JsonSerializable(typeof(int))]
+[JsonSerializable(typeof(uint))]
+[JsonSerializable(typeof(DateTime))]
+internal partial class JournalJsonContext : JsonSerializerContext;
+```
+
+Orleans Journaling APIs raise the `ORLEANSEXP005` diagnostic; suppress it with `<NoWarn>$(NoWarn);ORLEANSEXP005</NoWarn>`.
+
+### How journals are stored
+
+- Each journal is stored in the stream `orleansjournal-{JournalId}` (override with `KurrentJournalStorageOptions.GetStreamName`). The prefix makes `orleansjournal` the KurrentDB category of every journal stream.
+- Each append becomes an `orleans.journal.append` event. Writes larger than `MaxEventSize` (512 KiB) are split across several events in one atomic append.
+- Concurrent writers are detected with the stream revision: a second activation writing the same journal fails with `InconsistentStateException`.
+- Once `CompactionEventCountThreshold` (1,000) events or `CompactionSizeThreshold` (4 MiB) of journal bytes have been appended since the last snapshot, Orleans asks for compaction. The provider then appends an `orleans.journal.snapshot` event and moves the stream's `$tb` (truncate before) metadata to it, so older events are hidden and later scavenged. Other stream metadata (ACLs, `$maxAge`, custom properties) is preserved.
+- Recovery reads backwards to the latest snapshot and replays from there, so it never depends on truncation having succeeded.
+- Clearing state soft-deletes the stream, so the journal can be written again later.
+
+### Atomic compaction
+
+On KurrentDB 25.1 and later, compaction writes the snapshot and the `$tb` metadata in a single atomic multi-stream append to the journal stream and its metastream (`$$orleansjournal-…`). On older servers it appends the snapshot and then updates the metadata as a separate, best-effort step; if that second write fails, the older events simply stay until the next compaction. The provider checks the server's capabilities each time it compacts, so it notices upgrades and failovers. `KurrentJournalStorageOptions.AtomicCompaction` controls this:
+
+| Value | Behaviour |
+| --- | --- |
+| `Auto` (default) | Atomic when the server supports multi-stream appends, otherwise two writes. |
+| `Required` | Always atomic; compaction fails on servers older than 25.1. |
+| `Disabled` | Always two writes. |
+
+The account the provider connects with needs write access to the journal streams' metastreams, as it does for any stream metadata change.
+
+### Limitations
+
+- Every write must fit within the server's `MaxAppendSize` (1 MiB by default), including whole snapshots. Raise `MaxAppendSize` on the server if your durable state is larger.
+- In Orleans 10.4, grain durable state always uses the default journal storage provider. Named providers (`AddKurrentJournalStorage("name", ...)`) are reachable through the keyed `IJournaledStateManagerFactory`.
+- Journal metadata operations (`GetMetadataAsync`, `UpdateMetadataAsync`, `CreateIfNotExistsAsync`) and journal catalog listing (`IJournalStorageCatalog`) are not implemented yet. Orleans' state manager does not use them.
 
 ## Configuration
 

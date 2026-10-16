@@ -38,6 +38,23 @@ internal interface IKurrentClient : IDisposable, IAsyncDisposable
                                                                uint checkpointInterval,
                                                                CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Returns <see langword="true"/> if the connected server supports atomic multi-stream appends (KurrentDB 25.1+).
+    /// </summary>
+    /// <remarks>
+    /// The answer is per connection, so callers should ask again rather than cache it: a reconnect may reach a different node.
+    /// </remarks>
+    public ValueTask<bool> SupportsMultiStreamAppendAsync(CancellationToken cancellationToken)
+        => ValueTask.FromResult(false);
+
+    /// <summary>
+    /// Appends to several streams in one atomic operation; either every append succeeds or none do.
+    /// </summary>
+    /// <exception cref="WrongExpectedVersionException">Thrown if any stream's expected state does not match.</exception>
+    /// <exception cref="NotSupportedException">Thrown if the client or server does not support multi-stream appends.</exception>
+    public ValueTask<MultiStreamAppendResponse> MultiStreamAppendAsync(IReadOnlyList<AppendStreamRequest> requests,
+                                                                       CancellationToken cancellationToken)
+        => throw new NotSupportedException("Multi-stream appends are not supported by this client.");
 }
 
 /// <summary>

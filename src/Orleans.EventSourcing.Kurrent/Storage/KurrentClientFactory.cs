@@ -1,3 +1,4 @@
+using KurrentDB.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
@@ -17,8 +18,15 @@ internal static class KurrentClientFactory
     ///     Creates a KurrentClient instance.
     /// </summary>
     public static IKurrentClient Create(IServiceProvider serviceProvider, string name)
+        => Create(serviceProvider.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name).ClientSettings, name);
+
+    /// <summary>
+    ///     Creates a KurrentClient instance from explicit settings. <paramref name="name"/> selects the shared in-memory
+    ///     emulator instance when the settings point at the emulator address.
+    /// </summary>
+    public static IKurrentClient Create(KurrentDBClientSettings clientSettings, string name)
     {
-        var clientSettings = serviceProvider.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name).ClientSettings;
+        ArgumentNullException.ThrowIfNull(clientSettings);
 
         if (InMemoryEmulatorUri.Equals(clientSettings.ConnectivitySettings.Address) ||
             InMemoryEmulatorUriInsecure.Equals(clientSettings.ConnectivitySettings.Address))

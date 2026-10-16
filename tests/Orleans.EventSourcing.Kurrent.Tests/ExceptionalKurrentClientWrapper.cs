@@ -81,5 +81,17 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
         return passthrough.TombstoneStreamAsync(streamName, expectedRevision, token);
     }
 
+    public ValueTask<bool> SupportsMultiStreamAppendAsync(CancellationToken cancellationToken)
+        => passthrough.SupportsMultiStreamAppendAsync(cancellationToken);
+
+    public ValueTask<MultiStreamAppendResponse> MultiStreamAppendAsync(IReadOnlyList<AppendStreamRequest> requests, CancellationToken cancellationToken)
+    {
+        foreach (var request in requests)
+        {
+            ThrowIfException(request.Stream);
+        }
+        return passthrough.MultiStreamAppendAsync(requests, cancellationToken);
+    }
+
     #endregion
 }

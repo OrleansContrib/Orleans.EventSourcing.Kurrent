@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <!-- Orleans Journaling is experimental; every use of its API raises ORLEANSEXP005. -->
+    <NoWarn>$(NoWarn);ORLEANSEXP005</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- Microsoft.Orleans.Journaling requires Orleans 10.4, so the test host must match it. -->
+    <PackageReference Include="Microsoft.Orleans.TestingHost" VersionOverride="10.4.0" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Orleans.EventSourcing.Kurrent.Journaling\Orleans.EventSourcing.Kurrent.Journaling.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

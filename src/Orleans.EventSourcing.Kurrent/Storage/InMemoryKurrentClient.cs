@@ -119,15 +119,7 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
                 throw new StreamDeletedException(streamName);
             }
 
-            var streamState = StreamState.NoStream;
-            if (streams.TryGetValue(streamName, out var events))
-            {
-                streamState = StreamState.StreamRevision(all[events[^1]].EventNumber);
-            }
-
-            var metadata = GetStreamMetadataCore(streamName);
-            var isSoftDeleted = metadata.Metadata.TruncateBefore is not null
-                                && metadata.Metadata.TruncateBefore == StreamPosition.End;
+            var (streamState, isSoftDeleted) = GetStreamStateCore(streamName);
 
             // StreamState.Any means "no optimistic-concurrency check": accept the append regardless of the current revision.
             if (expectedRevision != StreamState.Any && streamState != expectedRevision && !isSoftDeleted)
@@ -136,44 +128,161 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
                 return (ConditionalWriteResult)ConditionalWriteResultConstructor.Invoke([streamState, default, ConditionalWriteStatus.VersionMismatch,]);
             }
 
-            if (events is null)
-            {
-                events = [];
-                streams[streamName] = events;
-            }
-
-            // Real KurrentDB: writing to a soft-deleted stream resumes the stream and existing events stay hidden.
-            // We model this by moving truncateBefore to the position of the first new event so subsequent reads
-            // only return events written after the soft delete.
-            if (isSoftDeleted)
-            {
-                var firstNewEventNumber = events.Count > 0
-                    ? StreamPosition.FromInt64(all[events[^1]].EventNumber.ToInt64() + 1)
-                    : StreamPosition.Start;
-
-                SetStreamMetadataCore(streamName,
-                                      metadata.MetastreamRevision.HasValue
-                                          ? StreamState.StreamRevision(metadata.MetastreamRevision.Value)
-                                          : StreamState.NoStream,
-                                      new StreamMetadata(truncateBefore: firstNewEventNumber));
-            }
-
-            foreach (var newEvent in eventData)
-            {
-                var nextEventNumber = events.Count > 0 ? all[events[^1]].EventNumber.ToUInt64() + 1 : 0;
-                var eventRecord = CreateEventRecord(newEvent, streamName, new StreamPosition(nextEventNumber), new Position((ulong)all.Count, (ulong)all.Count));
-                events.Add(all.Count);
-                all.Add(eventRecord);
-                newEventWatcher.Publish(eventRecord);
-            }
-
-            streamState = StreamState.StreamRevision(all[events[^1]].EventNumber);
+            streamState = AppendCore(streamName, eventData);
             return (ConditionalWriteResult)ConditionalWriteResultConstructor.Invoke([streamState, default, ConditionalWriteStatus.Succeeded,]);
         }
         finally
         {
             singleAccess.Release();
         }
+    }
+
+    private (StreamState StreamState, bool IsSoftDeleted) GetStreamStateCore(string streamName)
+    {
+        var streamState = streams.TryGetValue(streamName, out var events)
+            ? StreamState.StreamRevision(all[events[^1]].EventNumber)
+            : StreamState.NoStream;
+
+        var metadata = GetStreamMetadataCore(streamName);
+        var isSoftDeleted = metadata.Metadata.TruncateBefore is not null
+                            && metadata.Metadata.TruncateBefore == StreamPosition.End;
+
+        return (streamState, isSoftDeleted);
+    }
+
+    private StreamState AppendCore(string streamName, IEnumerable<EventData> eventData)
+    {
+        if (!streams.TryGetValue(streamName, out var events))
+        {
+            events = [];
+            streams[streamName] = events;
+        }
+
+        // Real KurrentDB: writing to a soft-deleted stream resumes the stream and existing events stay hidden.
+        // We model this by moving truncateBefore to the position of the first new event so subsequent reads
+        // only return events written after the soft delete.
+        var metadata = GetStreamMetadataCore(streamName);
+        if (metadata.Metadata.TruncateBefore is not null && metadata.Metadata.TruncateBefore == StreamPosition.End)
+        {
+            var firstNewEventNumber = events.Count > 0
+                ? StreamPosition.FromInt64(all[events[^1]].EventNumber.ToInt64() + 1)
+                : StreamPosition.Start;
+
+            SetStreamMetadataCore(streamName,
+                                  metadata.MetastreamRevision.HasValue
+                                      ? StreamState.StreamRevision(metadata.MetastreamRevision.Value)
+                                      : StreamState.NoStream,
+                                  new StreamMetadata(truncateBefore: firstNewEventNumber));
+        }
+
+        foreach (var newEvent in eventData)
+        {
+            var nextEventNumber = events.Count > 0 ? all[events[^1]].EventNumber.ToUInt64() + 1 : 0;
+            var eventRecord = CreateEventRecord(newEvent, streamName, new StreamPosition(nextEventNumber), new Position((ulong)all.Count, (ulong)all.Count));
+            events.Add(all.Count);
+            all.Add(eventRecord);
+            newEventWatcher.Publish(eventRecord);
+        }
+
+        return StreamState.StreamRevision(all[events[^1]].EventNumber);
+    }
+
+    /// <summary>
+    /// Controls whether this emulator behaves like a KurrentDB 25.1+ server that supports atomic multi-stream appends.
+    /// </summary>
+    internal bool MultiStreamAppendSupported { get; set; } = true;
+
+    public ValueTask<bool> SupportsMultiStreamAppendAsync(CancellationToken cancellationToken)
+        => ValueTask.FromResult(MultiStreamAppendSupported);
+
+    public async ValueTask<MultiStreamAppendResponse> MultiStreamAppendAsync(IReadOnlyList<AppendStreamRequest> requests, CancellationToken cancellationToken)
+    {
+        if (!MultiStreamAppendSupported)
+        {
+            throw new InvalidOperationException($"{nameof(MultiStreamAppendAsync)} requires server version 25.1 or higher.");
+        }
+
+        if (requests.Select(x => x.Stream).Distinct(StringComparer.Ordinal).Count() != requests.Count)
+        {
+            throw new ArgumentException("Each stream can only appear once in a multi-stream append.", nameof(requests));
+        }
+
+        await singleAccess.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Validate every expected state before writing anything so the operation is all-or-nothing, as on the server.
+            foreach (var request in requests)
+            {
+                if (StreamMetadataJson.TryGetOwningStream(request.Stream, out var owningStream))
+                {
+                    if (request.Messages.Any(x => x.Type != StreamMetadataJson.MetadataEventType))
+                    {
+                        throw new NotSupportedException($"The in-memory client only supports {StreamMetadataJson.MetadataEventType} events in metastreams.");
+                    }
+
+                    var metastreamState = streamMetadata.TryGetValue(owningStream, out var metadataEvents) && metadataEvents.Count > 0
+                        ? StreamState.StreamRevision((ulong)(metadataEvents.Count - 1))
+                        : StreamState.NoStream;
+
+                    if (!ExpectedStateMatches(request.ExpectedState, metastreamState, isSoftDeleted: false))
+                    {
+                        throw new WrongExpectedVersionException(request.Stream, request.ExpectedState, metastreamState);
+                    }
+                }
+                else
+                {
+                    if (tombstoned.Contains(request.Stream))
+                    {
+                        throw new StreamDeletedException(request.Stream);
+                    }
+
+                    var (streamState, isSoftDeleted) = GetStreamStateCore(request.Stream);
+                    if (!ExpectedStateMatches(request.ExpectedState, streamState, isSoftDeleted))
+                    {
+                        throw new WrongExpectedVersionException(request.Stream, request.ExpectedState, streamState);
+                    }
+                }
+            }
+
+            var responses = new List<AppendResponse>(requests.Count);
+            foreach (var request in requests)
+            {
+                if (StreamMetadataJson.TryGetOwningStream(request.Stream, out var owningStream))
+                {
+                    SuccessResult? result = null;
+                    foreach (var metadataEvent in request.Messages)
+                    {
+                        result = SetStreamMetadataCore(owningStream, StreamState.Any, StreamMetadataJson.Deserialize(metadataEvent.Data.Span));
+                    }
+                    responses.Add(new AppendResponse(request.Stream, result?.NextExpectedStreamState.ToInt64() ?? -1));
+                }
+                else
+                {
+                    responses.Add(new AppendResponse(request.Stream, AppendCore(request.Stream, request.Messages).ToInt64()));
+                }
+            }
+
+            return new MultiStreamAppendResponse(all.Count - 1, responses);
+        }
+        finally
+        {
+            singleAccess.Release();
+        }
+    }
+
+    private static bool ExpectedStateMatches(StreamState expected, StreamState actual, bool isSoftDeleted)
+    {
+        if (expected == StreamState.Any || isSoftDeleted)
+        {
+            return true;
+        }
+
+        if (expected == StreamState.StreamExists)
+        {
+            return actual != StreamState.NoStream;
+        }
+
+        return expected == actual;
     }
 
     private static EventRecord CreateEventRecord(EventData eventData, string eventStreamId, StreamPosition eventNumber, Position position)

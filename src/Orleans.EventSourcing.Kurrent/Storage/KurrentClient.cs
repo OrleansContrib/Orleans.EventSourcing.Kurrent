@@ -2,9 +2,16 @@ using KurrentDB.Client;
 
 namespace Orleans.EventSourcing.Kurrent.Storage;
 
-internal sealed class KurrentClient(KurrentDBClientSettings settings) : IKurrentClient
+internal sealed class KurrentClient : IKurrentClient
 {
-    private readonly KurrentDBClient client = new(settings);
+    private readonly KurrentDBClient client;
+    private readonly Lazy<ServerCapabilitiesProbe> capabilitiesProbe;
+
+    public KurrentClient(KurrentDBClientSettings settings)
+    {
+        client = new(settings);
+        capabilitiesProbe = new(() => new ServerCapabilitiesProbe(settings));
+    }
 
     public Task<IWriteResult> SetStreamMetadata(string streamName, StreamState expectedRevision, StreamMetadata streamMetadata, CancellationToken token)
         => client.SetStreamMetadataAsync(streamName,
@@ -73,7 +80,40 @@ internal sealed class KurrentClient(KurrentDBClientSettings settings) : IKurrent
     public Task<DeleteResult> TombstoneStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
         => client.TombstoneAsync(streamName, expectedRevision, cancellationToken: token);
 
-    public void Dispose() => client.Dispose();
+    public async ValueTask<bool> SupportsMultiStreamAppendAsync(CancellationToken cancellationToken)
+    {
+        var capabilities = await capabilitiesProbe.Value.GetServerCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
+        return capabilities.SupportsMultiStreamAppend;
+    }
 
-    public ValueTask DisposeAsync() => client.DisposeAsync();
+    public ValueTask<MultiStreamAppendResponse> MultiStreamAppendAsync(IReadOnlyList<AppendStreamRequest> requests, CancellationToken cancellationToken)
+        => client.MultiStreamAppendAsync(requests, cancellationToken);
+
+    public void Dispose()
+    {
+        client.Dispose();
+        if (capabilitiesProbe.IsValueCreated)
+        {
+            capabilitiesProbe.Value.Dispose();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await client.DisposeAsync().ConfigureAwait(false);
+        if (capabilitiesProbe.IsValueCreated)
+        {
+            await capabilitiesProbe.Value.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    // KurrentDBClient is sealed and only exposes the server capabilities it discovers on connect through the
+    // protected KurrentDBClientBase.GetChannelInfo, so this minimal subclass exists solely to read them.
+    // It keeps its own channel, which is cached per node, so repeated calls are cheap.
+    private sealed class ServerCapabilitiesProbe(KurrentDBClientSettings settings)
+        : KurrentDBClientBase(settings, new Dictionary<string, Func<Grpc.Core.RpcException, Exception>>())
+    {
+        public async ValueTask<ServerCapabilities> GetServerCapabilitiesAsync(CancellationToken cancellationToken)
+            => (await GetChannelInfo(cancellationToken).ConfigureAwait(false)).ServerCapabilities;
+    }
 }

@@ -12,6 +12,8 @@
   </PropertyGroup>	
   <ItemGroup>
     <InternalsVisibleTo Include="Orleans.EventSourcing.Kurrent.Tests" />
+    <InternalsVisibleTo Include="Orleans.EventSourcing.Kurrent.Journaling" />
+    <InternalsVisibleTo Include="Orleans.EventSourcing.Kurrent.Journaling.Tests" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="KurrentDB.Client" />
