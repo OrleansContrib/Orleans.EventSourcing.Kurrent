@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
 using Orleans.EventSourcing.Kurrent.Configuration;
+using Orleans.EventSourcing.Kurrent.Observability;
 
 namespace Orleans.EventSourcing.Kurrent.Storage;
 
@@ -16,6 +17,6 @@ internal static class LogConsistencyProviderFactory
     public static LogConsistencyProvider Create(IServiceProvider serviceProvider, string name)
     {
         var options = serviceProvider.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>();
-        return new LogConsistencyProvider(serviceProvider.GetRequiredKeyedService<IEventConverterFactory>(name), serviceProvider.GetRequiredKeyedService<IKurrentClient>(name), options.Get(name));
+        return new LogConsistencyProvider(serviceProvider.GetRequiredKeyedService<IEventConverterFactory>(name), serviceProvider.GetRequiredKeyedService<IKurrentClient>(name), options.Get(name), serviceProvider.GetRequiredService<KurrentMetrics>());
     }
 }

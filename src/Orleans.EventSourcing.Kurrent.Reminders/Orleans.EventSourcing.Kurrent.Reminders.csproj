@@ -9,6 +9,9 @@
 			<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 			<GenerateDocumentationFile>true</GenerateDocumentationFile>
 			<NoWarn>$(NoWarn);OEK0001;CS0618</NoWarn>
+			<!-- Track the reminder table grain's interface identity, [Version] and grain type in OrleansContracts.txt.
+			     Its methods are inherited from Orleans' IReminderTable, which the manifest doesn't record, so method changes are not tracked. -->
+			<EnableOrleansContractsAnalyzer>true</EnableOrleansContractsAnalyzer>
 		</PropertyGroup>
 		<ItemGroup>
 			<InternalsVisibleTo Include="Orleans.EventSourcing.Kurrent.Tests" />

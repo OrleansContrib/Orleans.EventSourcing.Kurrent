@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Data;
+using System.Diagnostics.Metrics;
 
 using Grpc.Core;
 
@@ -13,6 +15,7 @@ using Orleans.TestingHost;
 
 
 using Orleans.EventSourcing.Kurrent.Hosting;
+using Orleans.EventSourcing.Kurrent.Observability;
 using Orleans.EventSourcing.Kurrent.Storage;
 using Orleans.EventSourcing.Kurrent.Tests.Grains;
 using Orleans.EventSourcing.Kurrent.Projections;
@@ -59,6 +62,38 @@ public sealed class BasicTests : IAsyncLifetime
     {
         await cluster.DisposeAsync();
         kurrentClient.Dispose();
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task Metrics_ArePublishedThroughEachSilosMeterFactory()
+    {
+        var siloMeters = cluster.Silos.Select(silo =>
+        {
+            var metrics = silo.ServiceProvider.GetRequiredService<KurrentMetrics>();
+            Assert.Equal(KurrentMetrics.MeterName, metrics.Meter.Name);
+            Assert.Same(silo.ServiceProvider.GetRequiredService<IMeterFactory>(), metrics.Meter.Scope);
+            return metrics.Meter;
+        }).ToHashSet();
+
+        var recorded = new ConcurrentBag<string>();
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, meterListener) =>
+            {
+                if (siloMeters.Contains(instrument.Meter))
+                {
+                    meterListener.EnableMeasurementEvents(instrument);
+                }
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, _, _, _) => recorded.Add(instrument.Name));
+        listener.Start();
+
+        await cluster.Client.GetGrain<IStateGrain>(Guid.NewGuid()).SetValue(1, TestContext.Current.CancellationToken);
+        await cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid()).Deposit(10, TestContext.Current.CancellationToken);
+
+        Assert.Contains("State.Serialization", recorded);
+        Assert.Contains("Event.Serialization", recorded);
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]

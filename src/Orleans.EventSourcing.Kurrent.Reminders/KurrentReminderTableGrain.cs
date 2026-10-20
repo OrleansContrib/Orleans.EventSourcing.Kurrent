@@ -76,14 +76,14 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
             throw new InvalidOperationException($"Failed to remove reminder {reminderName} for grain {grainId} because state was modified concurrently. Please retry.");
         }
 
-        await Commit(Guid.NewGuid(), new RemovedV1(reminderEntry.GrainId, reminderEntry.ReminderName)).ConfigureAwait(true);
+        await Commit(Guid.NewGuid(), new RemovedV1(reminderEntry.GrainId, reminderEntry.ReminderName), cancellationToken).ConfigureAwait(true);
 
         return true;
     }
 
     public Task TestOnlyClearTable() => TestOnlyClearTable(CancellationToken.None);
 
-    public Task TestOnlyClearTable(CancellationToken cancellationToken) => Commit(Guid.NewGuid(), new ClearedV1());
+    public Task TestOnlyClearTable(CancellationToken cancellationToken) => Commit(Guid.NewGuid(), new ClearedV1(), cancellationToken);
 
     public Task<string?> UpsertRow(ReminderEntry entry)
         => UpsertRow(entry, CancellationToken.None);
@@ -98,13 +98,13 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
         }
 
         var eventId = Guid.NewGuid();
-        await Commit(eventId, new UpsertedV1(entry.GrainId, entry.ReminderName, entry.StartAt, entry.Period)).ConfigureAwait(true);
+        await Commit(eventId, new UpsertedV1(entry.GrainId, entry.ReminderName, entry.StartAt, entry.Period), cancellationToken).ConfigureAwait(true);
         return eventId.ToString("N");
     }
 
-    private Task Commit(Guid eventId, ReminderEvent reminderEvent)
+    private Task Commit(Guid eventId, ReminderEvent reminderEvent, CancellationToken cancellationToken)
     {
         RaiseEvent(new EventEnvelope<ReminderEvent>(eventId, reminderEvent));
-        return ConfirmEvents();
+        return ConfirmEvents().WaitAsync(cancellationToken);
     }
 }

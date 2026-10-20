@@ -21,7 +21,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     bool writeRejected;
     bool disposed;
 
-    public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider)
+    public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics)
     {
         this.host = host;
         this.context = new CommandContext
@@ -29,6 +29,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
             Client = client,
             StreamName = streamNameProvider.GetStreamName(services.GrainId),
             Converter = eventConverter,
+            Metrics = metrics,
             Host = host,
             Tags = new TagList
             {
@@ -500,7 +501,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
             serializationTags.Add("EventType", serializedEntries[i].Type);
 
-            Metrics.EventSerializationLatency.Record(sw.ElapsedMilliseconds, serializationTags);
+            context.Metrics.EventSerializationLatency.Record(sw.ElapsedMilliseconds, serializationTags);
         }
 
         return serializedEntries;
@@ -516,7 +517,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         deserializationTags.Add("EventType", logEntry.Event.EventType);
         var sw = Stopwatch.StartNew();
         var eventEntry = context.Converter.DeserializeEvent(logEntry);
-        Metrics.EventDeserializationLatency.Record(sw.ElapsedMilliseconds, deserializationTags);
+        context.Metrics.EventDeserializationLatency.Record(sw.ElapsedMilliseconds, deserializationTags);
         return eventEntry;
     }
 
@@ -530,6 +531,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         public required IKurrentClient Client { get; init; }
         public required string StreamName { get; init; }
         public required IEventConverter<TLogEntry> Converter { get; init; }
+        public required KurrentMetrics Metrics { get; init; }
         public required ILogViewAdaptorHost<TLogView, TLogEntry> Host { get; init; }
         public required TagList Tags { get; init; }
     }

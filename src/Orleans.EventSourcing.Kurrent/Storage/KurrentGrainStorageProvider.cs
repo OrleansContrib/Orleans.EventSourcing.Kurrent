@@ -12,7 +12,7 @@ namespace Orleans.EventSourcing.Kurrent.Storage;
 /// <summary>
 ///      Kurrent-based log consistent storage provider.
 /// </summary>
-internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, IEventConverterFactory eventSerializer, IKurrentStreamNameProvider streamNameProvider) : IGrainStorage
+internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, IEventConverterFactory eventSerializer, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics) : IGrainStorage
 {
     private static StreamState ConvertETagToStreamState(string? eTag)
     {
@@ -104,7 +104,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
 
                 var sw = Stopwatch.StartNew();
                 grainState.State = eventSerializer.GetEventConverter<T>().DeserializeEvent(enumerator.Current);
-                Metrics.StateDeserializationLatency.Record(sw.ElapsedMilliseconds, observabilityTags);
+                metrics.StateDeserializationLatency.Record(sw.ElapsedMilliseconds, observabilityTags);
 
                 // A second event would indicate the stream metadata wasn't written successfully on the first write
                 if (await enumerator.MoveNextAsync().ConfigureAwait(false))
@@ -172,7 +172,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
 
             var sw = Stopwatch.StartNew();
             var eventRecord = eventSerializer.GetEventConverter<T>().SerializeEvent(state);
-            Metrics.StateSerializationLatency.Record(sw.ElapsedMilliseconds, observabilityTags);
+            metrics.StateSerializationLatency.Record(sw.ElapsedMilliseconds, observabilityTags);
 
             var result = await kurrentClient.ConditionalAppendToStreamAsync(streamName,
                                                                             expectedStreamState,
