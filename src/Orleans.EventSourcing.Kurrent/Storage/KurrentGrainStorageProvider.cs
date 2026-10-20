@@ -45,6 +45,8 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     /// <inheritdoc/>
     public async Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (grainState.RecordExists)
         {
             var streamState = ConvertETagToStreamState(grainState.ETag);
@@ -73,6 +75,8 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     /// <inheritdoc/>
     public async Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         var observabilityTags = new TagList
         {
             { "GrainType", grainId.Type },
@@ -117,6 +121,11 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                 await enumerator.DisposeAsync().ConfigureAwait(false);
             }
         }
+        catch (Exception ex) when (KurrentExceptionConverter.IsRequestedCancellation(ex, cancellationToken))
+        {
+            // A read has no side effects, so caller-requested cancellation surfaces as cancellation
+            throw new OperationCanceledException("Reading grain state was cancelled.", ex, cancellationToken);
+        }
         catch (Exception ex)
         {
             throw KurrentExceptionConverter.ConvertException(ex);
@@ -154,6 +163,8 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     /// <inheritdoc/>
     public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         var observabilityTags = new TagList
         {
             { "GrainType", grainId.Type },

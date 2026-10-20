@@ -104,7 +104,10 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
 
     private Task Commit(Guid eventId, ReminderEvent reminderEvent, CancellationToken cancellationToken)
     {
+        // Cancellation is only honoured before the event is raised: once queued, the append proceeds,
+        // and confirmation must be awaited so a failed write surfaces as InconsistentStateException and triggers recovery
+        cancellationToken.ThrowIfCancellationRequested();
         RaiseEvent(new EventEnvelope<ReminderEvent>(eventId, reminderEvent));
-        return ConfirmEvents().WaitAsync(cancellationToken);
+        return ConfirmEvents();
     }
 }

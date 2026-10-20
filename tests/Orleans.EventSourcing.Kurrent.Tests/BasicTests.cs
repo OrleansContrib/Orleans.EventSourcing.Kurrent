@@ -96,6 +96,61 @@ public sealed class BasicTests : IAsyncLifetime
         Assert.Contains("Event.Serialization", recorded);
     }
 
+    private IGrainStorage GrainStorage
+        => cluster.GetSiloServiceProvider().GetRequiredKeyedService<IGrainStorage>(ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME);
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_PreCancelledToken_ThrowsWithoutWriting()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var cancelled = new CancellationToken(canceled: true);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => GrainStorage.WriteStateAsync("test", grainId, new GrainState<GrainState>(new GrainState { Value = 1 }), cancelled));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => GrainStorage.ReadStateAsync("test", grainId, new GrainState<GrainState>(), cancelled));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => GrainStorage.ClearStateAsync("test", grainId, new GrainState<GrainState>(), cancelled));
+
+        var stored = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync("test", grainId, stored, TestContext.Current.CancellationToken);
+        Assert.False(stored.RecordExists);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_CancelledDuringRead_ThrowsOperationCanceled()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        using var cancellation = new CancellationTokenSource();
+        kurrentClient.CancelOnceForTesting(streamNameProvider.GetStreamName("test", grainId), cancellation);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => GrainStorage.ReadStateAsync("test", grainId, new GrainState<GrainState>(), cancellation.Token));
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_CancelledDuringWrite_ThrowsInconsistentState()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        using var cancellation = new CancellationTokenSource();
+        kurrentClient.CancelOnceForTesting(streamNameProvider.GetStreamName("test", grainId), cancellation);
+
+        // The append may already have been applied, so the outcome is uncertain and recovery is needed
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.WriteStateAsync("test", grainId, new GrainState<GrainState>(new GrainState { Value = 1 }), cancellation.Token));
+        Assert.IsAssignableFrom<OperationCanceledException>(ex.InnerException);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_CancelledDuringClear_ThrowsInconsistentState()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+
+        using var cancellation = new CancellationTokenSource();
+        kurrentClient.CancelOnceForTesting(streamNameProvider.GetStreamName("test", grainId), cancellation);
+
+        // The delete may already have been applied, so the outcome is uncertain and recovery is needed
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.ClearStateAsync("test", grainId, state, cancellation.Token));
+        Assert.IsAssignableFrom<OperationCanceledException>(ex.InnerException);
+    }
+
     [Fact(Timeout = IntegrationTestTimeout)]
     public async Task DepositWithdraw()
     {
