@@ -1,10 +1,11 @@
 using KurrentDB.Client;
-using LoadTest.Silo;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Orleans.Dashboard;
 using Orleans.EventSourcing.Kurrent.Hosting;
 using Orleans.EventSourcing.Kurrent.Reminders;
+using Orleans.Storage;
 
 // Connection string for KurrentDB. The special host "kurrentemulator" selects the in-process,
 // in-memory Kurrent implementation so the load test runs without external infrastructure.
@@ -32,14 +33,14 @@ builder.UseOrleans(silo =>
     silo.AddDashboard();
     silo.UseKurrentClustering(o => { o.ClientSettings = clientSettings; o.EventCountBeforeSnapshot = 50; });
     //silo.UseLocalhostClustering();
-    silo.AddKurrentBasedLogConsistencyProviderAsDefault(o =>
+    silo.AddKurrentBasedLogConsistencyProviderAsDefault(optionsBuilder => optionsBuilder.Configure<IServiceProvider>((o, sp) =>
     {
         o.ClientSettings = clientSettings;
         if (serializerName == "stj")
         {
-            o.GrainStorageSerializer = new SystemTextJsonGrainStorageSerializer();
+            o.GrainStorageSerializer = ActivatorUtilities.CreateInstance<SystemTextJsonGrainStorageSerializer>(sp);
         }
-    });
+    }));
     silo.AddKurrentReminderService(o => o.ClientSettings = clientSettings);
 });
 

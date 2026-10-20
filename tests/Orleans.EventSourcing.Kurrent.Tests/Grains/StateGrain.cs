@@ -4,15 +4,15 @@ namespace Orleans.EventSourcing.Kurrent.Tests.Grains;
 interface IStateGrain : IGrainWithGuidKey
 {
     [Alias("GetValue")]
-    ValueTask<int> GetValue();
+    ValueTask<int> GetValue(CancellationToken cancellationToken = default);
     [Alias("GetEtag")]
-    ValueTask<string> GetEtag();
+    ValueTask<string?> GetEtag(CancellationToken cancellationToken = default);
     [Alias("SetValue")]
-    Task SetValue(int value);
+    Task SetValue(int value, CancellationToken cancellationToken = default);
     [Alias("ClearValue")]
-    Task ClearValue();
+    Task ClearValue(CancellationToken cancellationToken = default);
     [Alias("RecordExists")]
-    ValueTask<bool> RecordExists();
+    ValueTask<bool> RecordExists(CancellationToken cancellationToken = default);
 }
 
 record GrainState
@@ -22,20 +22,18 @@ record GrainState
 
 internal class StateGrain([PersistentState("test")] IPersistentState<GrainState> state) : Grain, IStateGrain
 {
-    public async Task ClearValue() => await state.ClearStateAsync();
+    public async Task ClearValue(CancellationToken cancellationToken) => await state.ClearStateAsync(cancellationToken);
 
-#pragma warning disable CS8613 // Nullability of reference types in return type doesn't match implicitly implemented member.
-    public ValueTask<string?> GetEtag()
-#pragma warning restore CS8613 // Nullability of reference types in return type doesn't match implicitly implemented member.
+    public ValueTask<string?> GetEtag(CancellationToken cancellationToken)
      => ValueTask.FromResult(state.Etag);
 
-    public ValueTask<int> GetValue() => ValueTask.FromResult(state.State.Value);
+    public ValueTask<int> GetValue(CancellationToken cancellationToken) => ValueTask.FromResult(state.State.Value);
 
-    public ValueTask<bool> RecordExists() => ValueTask.FromResult(state.RecordExists);
+    public ValueTask<bool> RecordExists(CancellationToken cancellationToken) => ValueTask.FromResult(state.RecordExists);
 
-    public async Task SetValue(int value)
+    public async Task SetValue(int value, CancellationToken cancellationToken)
     {
         state.State.Value = value;
-        await state.WriteStateAsync();
+        await state.WriteStateAsync(cancellationToken);
     }
 }

@@ -65,18 +65,18 @@ public sealed class BasicTests : IAsyncLifetime
     public async Task DepositWithdraw()
     {
         var account = cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid());
-        Assert.Equal(0, await account.GetConfirmedBalance());
-        await account.Deposit(10);
-        Assert.Equal(10, await account.GetConfirmedBalance());
-        Assert.False(await account.Withdraw(15));
-        Assert.True(await account.Withdraw(5));
-        Assert.Equal(5, await account.GetConfirmedBalance());
+        Assert.Equal(0, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        await account.Deposit(10, TestContext.Current.CancellationToken);
+        Assert.Equal(10, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.False(await account.Withdraw(15, TestContext.Current.CancellationToken));
+        Assert.True(await account.Withdraw(5, TestContext.Current.CancellationToken));
+        Assert.Equal(5, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
-        Assert.Equal(5, await account.GetConfirmedBalance());
+        Assert.Equal(5, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        var @events = await account.GetEvents();
+        var @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Equal(2, @events.Count);
         var deposited = Assert.IsType<AccountEvent.Deposited>(events[0]);
         Assert.Equal(10, deposited.Amount);
@@ -90,35 +90,35 @@ public sealed class BasicTests : IAsyncLifetime
         // GetEvents calls internally RetrieveConfirmedEvents(0, ConfirmedVersion);
         // by checking the explicit version we check events start at 1
         var account = cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid());
-        var @events = await account.GetEvents();
+        var @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Empty(@events);
-        Assert.Equal(0, await account.GetConfirmedVersion());
-        Assert.Equal(0, await account.GetConfirmedBalance());
+        Assert.Equal(0, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(0, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        await account.Deposit(10);
+        await account.Deposit(10, TestContext.Current.CancellationToken);
 
-        @events = await account.GetEvents();
+        @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Single(@events);
-        Assert.Equal(1, await account.GetConfirmedVersion());
-        Assert.Equal(10, await account.GetConfirmedBalance());
-        Assert.Equal(10, Assert.IsType<AccountEvent.Deposited>(await account.GetEventAtVersion(1)).Amount);
+        Assert.Equal(1, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(10, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(10, Assert.IsType<AccountEvent.Deposited>(await account.GetEventAtVersion(1, TestContext.Current.CancellationToken)).Amount);
 
-        await account.RefreshNow(); // re-read state from storage
+        await account.RefreshNow(TestContext.Current.CancellationToken); // re-read state from storage
 
-        @events = await account.GetEvents();
+        @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Single(@events);
-        Assert.Equal(1, await account.GetConfirmedVersion());
-        Assert.Equal(10, await account.GetConfirmedBalance());
-        Assert.Equal(10, Assert.IsType<AccountEvent.Deposited>(await account.GetEventAtVersion(1)).Amount);
+        Assert.Equal(1, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(10, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(10, Assert.IsType<AccountEvent.Deposited>(await account.GetEventAtVersion(1, TestContext.Current.CancellationToken)).Amount);
 
-        await account.Withdraw(5);
+        await account.Withdraw(5, TestContext.Current.CancellationToken);
 
-        @events = await account.GetEvents();
+        @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Equal(2, @events.Count);
-        Assert.Equal(2, await account.GetConfirmedVersion());
-        Assert.Equal(5, await account.GetConfirmedBalance());
-        Assert.Equal(10, Assert.IsType<AccountEvent.Deposited>(await account.GetEventAtVersion(1)).Amount);
-        Assert.Equal(5, Assert.IsType<AccountEvent.Withdrawn>(await account.GetEventAtVersion(2)).Amount);
+        Assert.Equal(2, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(5, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(10, Assert.IsType<AccountEvent.Deposited>(await account.GetEventAtVersion(1, TestContext.Current.CancellationToken)).Amount);
+        Assert.Equal(5, Assert.IsType<AccountEvent.Withdrawn>(await account.GetEventAtVersion(2, TestContext.Current.CancellationToken)).Amount);
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -126,8 +126,8 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var eventId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid());
-        await account.Deposit(10, eventId);
-        var @events = await account.GetEvents();
+        await account.Deposit(10, eventId, TestContext.Current.CancellationToken);
+        var @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Single(@events);
         var deposited = Assert.IsType<AccountEvent.Deposited>(events[0]);
         Assert.Equal(10, deposited.Amount);
@@ -140,24 +140,24 @@ public sealed class BasicTests : IAsyncLifetime
         var accountGrainId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountGrainId);
 
-        await account.Deposit(100);
+        await account.Deposit(100, TestContext.Current.CancellationToken);
 
         await kurrentClient.DuplicateLastEventInStream(streamNameProvider.GetStreamName(account.GetGrainId()));
 
-        Assert.Equal(100, await account.GetConfirmedBalance());
-        Assert.False(await account.Withdraw(66));
-        Assert.Equal(34, await account.GetTentativeBalance());
-        Assert.Equal(100, await account.GetConfirmedBalance());
-        Assert.False(await account.Withdraw(33));
-        Assert.Equal(1, await account.GetTentativeBalance());
-        Assert.Equal(100, await account.GetConfirmedBalance());
+        Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.False(await account.Withdraw(66, TestContext.Current.CancellationToken));
+        Assert.Equal(34, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.False(await account.Withdraw(33, TestContext.Current.CancellationToken));
+        Assert.Equal(1, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        await Assert.ThrowsAsync<InconsistentStateException>(async () => { await account.Deposit(11); }); // causes grain restart
-        Assert.Equal(200, await account.GetConfirmedBalance());
-        await account.Deposit(22);
-        Assert.Equal(222, await account.GetConfirmedBalance());
+        await Assert.ThrowsAsync<InconsistentStateException>(async () => { await account.Deposit(11, TestContext.Current.CancellationToken); }); // causes grain restart
+        Assert.Equal(200, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        await account.Deposit(22, TestContext.Current.CancellationToken);
+        Assert.Equal(222, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        var @events = await account.GetEvents();
+        var @events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Equal(3, @events.Count);
         Assert.Equal(100, Assert.IsType<AccountEvent.Deposited>(events[0]).Amount);
         Assert.Equal(100, Assert.IsType<AccountEvent.Deposited>(events[1]).Amount);
@@ -177,34 +177,34 @@ public sealed class BasicTests : IAsyncLifetime
 
         foreach (var i in powersOfTwo)
         {
-            await account.Deposit(i);
+            await account.Deposit(i, TestContext.Current.CancellationToken);
         }
         foreach (var i in powersOfTwo)
         {
-            await account.Deposit(i);
-            await account.Withdraw(i);
+            await account.Deposit(i, TestContext.Current.CancellationToken);
+            await account.Withdraw(i, TestContext.Current.CancellationToken);
         }
 
-        Assert.Equal((powersOfTwo[^1] * 2) - 1, await account.GetConfirmedBalance());
-        Assert.Equal(powersOfTwo.Count * 3, (await account.GetEvents()).Count);
+        Assert.Equal((powersOfTwo[^1] * 2) - 1, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(powersOfTwo.Count * 3, (await account.GetEvents(TestContext.Current.CancellationToken)).Count);
 
         // remove the first iteration of deposits
         await kurrentClient.SetStreamMetadata(streamNameProvider.GetStreamName(account.GetGrainId()), StreamState.NoStream, new StreamMetadata(truncateBefore: StreamPosition.FromStreamRevision(10)), TestContext.Current.CancellationToken);
-        Assert.Equal(powersOfTwo.Count * 2, (await account.GetEvents()).Count);
+        Assert.Equal(powersOfTwo.Count * 2, (await account.GetEvents(TestContext.Current.CancellationToken)).Count);
 
-        Assert.Equal((powersOfTwo[^1] * 2) - 1, await account.GetConfirmedBalance());
+        Assert.Equal((powersOfTwo[^1] * 2) - 1, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        await account.RefreshNow(); // re-read state from storage
+        await account.RefreshNow(TestContext.Current.CancellationToken); // re-read state from storage
 
-        Assert.Equal(0, await account.GetConfirmedBalance());
+        Assert.Equal(0, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
         // remove the events from all above iterations and check the last added event remains
-        await account.Deposit(77);
-        Assert.Equal(77, await account.GetConfirmedBalance());
+        await account.Deposit(77, TestContext.Current.CancellationToken);
+        Assert.Equal(77, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
         await kurrentClient.SetStreamMetadata(streamNameProvider.GetStreamName(account.GetGrainId()), StreamState.StreamRevision(0), new StreamMetadata(truncateBefore: StreamPosition.FromStreamRevision(30)), TestContext.Current.CancellationToken);
-        Assert.Single(await account.GetEvents());
-        await account.RefreshNow();
-        Assert.Equal(77, await account.GetConfirmedBalance());
+        Assert.Single(await account.GetEvents(TestContext.Current.CancellationToken));
+        await account.RefreshNow(TestContext.Current.CancellationToken);
+        Assert.Equal(77, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -216,23 +216,23 @@ public sealed class BasicTests : IAsyncLifetime
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new TimeoutException("Test read exception"));
 
-        var ex1 = await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(11));
+        var ex1 = await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(11, TestContext.Current.CancellationToken));
         Assert.IsType<TimeoutException>(ex1.InnerException);
 
-        await account.Deposit(22);
+        await account.Deposit(22, TestContext.Current.CancellationToken);
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new RpcException(new Status(StatusCode.DeadlineExceeded, "RPC timeout blah blah")));
 
-        await account.DepositWithoutConfirm(33); // exception will be seen on following write
+        await account.DepositWithoutConfirm(33, TestContext.Current.CancellationToken); // exception will be seen on following write
 
-        var ex2 = await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(5));
+        var ex2 = await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(5, TestContext.Current.CancellationToken));
         Assert.IsType<RpcException>(ex2.InnerException);
 
-        Assert.Equal(22, await account.GetConfirmedBalance());
+        Assert.Equal(22, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new StreamDeletedException("stream name"));
 
-        var ex3 = await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(11));
+        var ex3 = await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(11, TestContext.Current.CancellationToken));
         Assert.IsType<StreamDeletedException>(ex3.InnerException);
     }
 
@@ -241,48 +241,48 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var stateGrain = cluster.Client.GetGrain<IStateGrain>(Guid.NewGuid());
 
-        Assert.False(await stateGrain.RecordExists());
-        Assert.Equal(42, await stateGrain.GetValue());
-        Assert.Equal(string.Empty, await stateGrain.GetEtag());
+        Assert.False(await stateGrain.RecordExists(TestContext.Current.CancellationToken));
+        Assert.Equal(42, await stateGrain.GetValue(TestContext.Current.CancellationToken));
+        Assert.Equal(string.Empty, await stateGrain.GetEtag(TestContext.Current.CancellationToken));
 
-        await stateGrain.SetValue(99393);
-        Assert.True(await stateGrain.RecordExists());
-        Assert.Equal("0", await stateGrain.GetEtag());
+        await stateGrain.SetValue(99393, TestContext.Current.CancellationToken);
+        Assert.True(await stateGrain.RecordExists(TestContext.Current.CancellationToken));
+        Assert.Equal("0", await stateGrain.GetEtag(TestContext.Current.CancellationToken));
 
-        await stateGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await stateGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
-        Assert.Equal(99393, await stateGrain.GetValue());
-        Assert.True(await stateGrain.RecordExists());
-        Assert.Equal("0", await stateGrain.GetEtag());
+        Assert.Equal(99393, await stateGrain.GetValue(TestContext.Current.CancellationToken));
+        Assert.True(await stateGrain.RecordExists(TestContext.Current.CancellationToken));
+        Assert.Equal("0", await stateGrain.GetEtag(TestContext.Current.CancellationToken));
 
-        await stateGrain.ClearValue();
-        Assert.Equal(string.Empty, await stateGrain.GetEtag());
-        Assert.False(await stateGrain.RecordExists());
-        Assert.Equal(42, await stateGrain.GetValue());
+        await stateGrain.ClearValue(TestContext.Current.CancellationToken);
+        Assert.Equal(string.Empty, await stateGrain.GetEtag(TestContext.Current.CancellationToken));
+        Assert.False(await stateGrain.RecordExists(TestContext.Current.CancellationToken));
+        Assert.Equal(42, await stateGrain.GetValue(TestContext.Current.CancellationToken));
 
-        await stateGrain.ClearValue();
-        await stateGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await stateGrain.ClearValue(TestContext.Current.CancellationToken);
+        await stateGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
         // Check state after clear
-        Assert.False(await stateGrain.RecordExists());
-        Assert.Equal(string.Empty, await stateGrain.GetEtag());
-        Assert.Equal(42, await stateGrain.GetValue());
+        Assert.False(await stateGrain.RecordExists(TestContext.Current.CancellationToken));
+        Assert.Equal(string.Empty, await stateGrain.GetEtag(TestContext.Current.CancellationToken));
+        Assert.Equal(42, await stateGrain.GetValue(TestContext.Current.CancellationToken));
 
         // Check reading and writing after clearing
 
-        await stateGrain.SetValue(519235351);
-        Assert.True(await stateGrain.RecordExists());
-        Assert.Equal(519235351, await stateGrain.GetValue());
-        Assert.Equal("1", await stateGrain.GetEtag());
+        await stateGrain.SetValue(519235351, TestContext.Current.CancellationToken);
+        Assert.True(await stateGrain.RecordExists(TestContext.Current.CancellationToken));
+        Assert.Equal(519235351, await stateGrain.GetValue(TestContext.Current.CancellationToken));
+        Assert.Equal("1", await stateGrain.GetEtag(TestContext.Current.CancellationToken));
 
-        await stateGrain.ClearValue();
+        await stateGrain.ClearValue(TestContext.Current.CancellationToken);
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
     public async Task TestDeleteOnNonExistantState()
     {
         var stateGrain = cluster.Client.GetGrain<IStateGrain>(Guid.NewGuid());
-        await stateGrain.ClearValue();
+        await stateGrain.ClearValue(TestContext.Current.CancellationToken);
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -290,11 +290,11 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var stateGrain = cluster.Client.GetGrain<IStateGrain>(Guid.NewGuid());
 
-        await stateGrain.SetValue(99393);
+        await stateGrain.SetValue(99393, TestContext.Current.CancellationToken);
 
         await kurrentClient.DuplicateLastEventInStream(streamNameProvider.GetStreamName("test", stateGrain.GetGrainId()));
 
-        await Assert.ThrowsAsync<InconsistentStateException>(() => stateGrain.SetValue(356));
+        await Assert.ThrowsAsync<InconsistentStateException>(() => stateGrain.SetValue(356, TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -302,11 +302,11 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var stateGrain = cluster.Client.GetGrain<IStateGrain>(Guid.NewGuid());
 
-        await stateGrain.SetValue(99393);
+        await stateGrain.SetValue(99393, TestContext.Current.CancellationToken);
 
         await kurrentClient.DuplicateLastEventInStream(streamNameProvider.GetStreamName("test", stateGrain.GetGrainId()));
 
-        await Assert.ThrowsAsync<InconsistentStateException>(() => stateGrain.ClearValue());
+        await Assert.ThrowsAsync<InconsistentStateException>(() => stateGrain.ClearValue(TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -371,9 +371,9 @@ public sealed class BasicTests : IAsyncLifetime
             return (total, creditRatingCount > 0 ? creditRatingSum / creditRatingCount : 0);
         });
 
-        await cluster.Client.GetGrain<IAccountGrain>(idsForThisTest[0]).Deposit(45);
-        await cluster.Client.GetGrain<IAccountGrain>(idsForThisTest[1]).Deposit(831);
-        await cluster.Client.GetGrain<IAccountGrain>(idsForThisTest[2]).Deposit(1563);
+        await cluster.Client.GetGrain<IAccountGrain>(idsForThisTest[0]).Deposit(45, TestContext.Current.CancellationToken);
+        await cluster.Client.GetGrain<IAccountGrain>(idsForThisTest[1]).Deposit(831, TestContext.Current.CancellationToken);
+        await cluster.Client.GetGrain<IAccountGrain>(idsForThisTest[2]).Deposit(1563, TestContext.Current.CancellationToken);
         await cluster.Client.GetGrain<IUserGrain>(idsForThisTest[3]).UpdateCreditRating(5);
 
         var (totalBalance, average) = await projection;
@@ -389,9 +389,9 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(100);
-        await account.Deposit(200);
-        await account.Withdraw(50);
+        await account.Deposit(100, TestContext.Current.CancellationToken);
+        await account.Deposit(200, TestContext.Current.CancellationToken);
+        await account.Withdraw(50, TestContext.Current.CancellationToken);
 
         var receivedEvents = new List<object>();
 
@@ -420,9 +420,9 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(100);
-        await account.Deposit(200);
-        await account.Withdraw(50);
+        await account.Deposit(100, TestContext.Current.CancellationToken);
+        await account.Deposit(200, TestContext.Current.CancellationToken);
+        await account.Withdraw(50, TestContext.Current.CancellationToken);
 
         var receivedEvents = new List<int>();
 
@@ -450,7 +450,7 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(100);
+        await account.Deposit(100, TestContext.Current.CancellationToken);
 
         var receivedEventVersions = new List<int>();
 
@@ -478,7 +478,7 @@ public sealed class BasicTests : IAsyncLifetime
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
         var user = cluster.Client.GetGrain<IUserGrain>(userId);
 
-        await account.Deposit(123);
+        await account.Deposit(123, TestContext.Current.CancellationToken);
         await user.UpdateCreditRating(7);
 
         var receivedEvents = new List<object>();
@@ -532,11 +532,11 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var account = cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid());
 
-        await account.ClearLog();
+        await account.ClearLog(TestContext.Current.CancellationToken);
 
-        Assert.Equal(0, await account.GetConfirmedVersion());
-        Assert.Equal(0, await account.GetConfirmedBalance());
-        Assert.Empty(await account.GetEvents());
+        Assert.Equal(0, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(0, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Empty(await account.GetEvents(TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -544,20 +544,20 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var account = cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid());
 
-        await account.Deposit(10);
-        await account.Deposit(20);
-        Assert.Equal(2, await account.GetConfirmedVersion());
-        Assert.Equal(30, await account.GetConfirmedBalance());
+        await account.Deposit(10, TestContext.Current.CancellationToken);
+        await account.Deposit(20, TestContext.Current.CancellationToken);
+        Assert.Equal(2, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(30, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
-        await account.ClearLog();
+        await account.ClearLog(TestContext.Current.CancellationToken);
 
-        Assert.Equal(0, await account.GetConfirmedVersion());
-        Assert.Equal(0, await account.GetConfirmedBalance());
-        Assert.Equal(0, await account.GetTentativeBalance());
-        Assert.Empty(await account.GetEvents());
+        Assert.Equal(0, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(0, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(0, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
+        Assert.Empty(await account.GetEvents(TestContext.Current.CancellationToken));
 
         // Re-appending after a hard delete should fail,
-        await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(7));
+        await Assert.ThrowsAsync<InconsistentStateException>(() => account.Deposit(7, TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -566,14 +566,14 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(50);
-        await account.ClearLog();
+        await account.Deposit(50, TestContext.Current.CancellationToken);
+        await account.ClearLog(TestContext.Current.CancellationToken);
 
-        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
-        Assert.Equal(0, await account.GetConfirmedVersion());
-        Assert.Equal(0, await account.GetConfirmedBalance());
-        Assert.Empty(await account.GetEvents());
+        Assert.Equal(0, await account.GetConfirmedVersion(TestContext.Current.CancellationToken));
+        Assert.Equal(0, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Empty(await account.GetEvents(TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -581,12 +581,12 @@ public sealed class BasicTests : IAsyncLifetime
     {
         var account = cluster.Client.GetGrain<IAccountGrain>(Guid.NewGuid());
 
-        await account.Deposit(10);
+        await account.Deposit(10, TestContext.Current.CancellationToken);
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()),
                                                          new TimeoutException("Test delete exception"));
 
-        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => account.ClearLog());
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => account.ClearLog(TestContext.Current.CancellationToken));
         Assert.IsType<TimeoutException>(ex.InnerException);
     }
 
@@ -596,19 +596,19 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(10);
-        await account.Deposit(20);
-        await account.TruncateAccount();   // truncation marker – events 0 and 1 should become hidden on reload
-        await account.Deposit(5);
+        await account.Deposit(10, TestContext.Current.CancellationToken);
+        await account.Deposit(20, TestContext.Current.CancellationToken);
+        await account.TruncateAccount(TestContext.Current.CancellationToken);   // truncation marker – events 0 and 1 should become hidden on reload
+        await account.Deposit(5, TestContext.Current.CancellationToken);
 
         // Deactivate so the grain reloads state from storage (respecting $tb).
-        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
         // After reload only the post-truncation events should contribute to the balance.
-        Assert.Equal(35, await account.GetConfirmedBalance());
+        Assert.Equal(35, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
         // Only the events from the truncation marker onwards should be visible.
-        var events = await account.GetEvents();
+        var events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Equal(2, events.Count); // Truncation + Deposited(5)
         Assert.IsType<AccountEvent.Truncation>(events[0]);
         Assert.IsType<AccountEvent.Deposited>(events[1]);
@@ -620,22 +620,22 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(100);
-        await account.DepositWithoutConfirm(25);
-        await account.TruncateAccountWithoutConfirm();
+        await account.Deposit(100, TestContext.Current.CancellationToken);
+        await account.DepositWithoutConfirm(25, TestContext.Current.CancellationToken);
+        await account.TruncateAccountWithoutConfirm(TestContext.Current.CancellationToken);
 
-        Assert.Equal(125, await account.GetTentativeBalance());
+        Assert.Equal(125, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
 
-        await account.DepositWithoutConfirm(42);
+        await account.DepositWithoutConfirm(42, TestContext.Current.CancellationToken);
 
-        Assert.Equal(167, await account.GetTentativeBalance());
+        Assert.Equal(167, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
 
-        await account.ConfirmPendingEvents();
+        await account.ConfirmPendingEvents(TestContext.Current.CancellationToken);
 
-        Assert.Equal(167, await account.GetConfirmedBalance());
-        Assert.Equal(167, await account.GetTentativeBalance());
+        Assert.Equal(167, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(167, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
 
-        var events = await account.GetEvents();
+        var events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Equal(2, events.Count);
         Assert.IsType<AccountEvent.Truncation>(events[0]);
         Assert.Equal(42, Assert.IsType<AccountEvent.Deposited>(events[1]).Amount);
@@ -647,14 +647,14 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(100);
-        await account.TruncateAccount();
-        await account.Deposit(42);
+        await account.Deposit(100, TestContext.Current.CancellationToken);
+        await account.TruncateAccount(TestContext.Current.CancellationToken);
+        await account.Deposit(42, TestContext.Current.CancellationToken);
 
         // Deactivate so the grain reloads from storage
-        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
-        Assert.Equal(142, await account.GetConfirmedBalance());
+        Assert.Equal(142, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -663,17 +663,17 @@ public sealed class BasicTests : IAsyncLifetime
         var accountId = Guid.NewGuid();
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
 
-        await account.Deposit(50);
-        await account.Deposit(50);
+        await account.Deposit(50, TestContext.Current.CancellationToken);
+        await account.Deposit(50, TestContext.Current.CancellationToken);
 
         // Raise truncation as the sole event in a batch.
-        await account.TruncateAccount();
+        await account.TruncateAccount(TestContext.Current.CancellationToken);
 
         // Deactivate so the grain reloads from storage with $tb applied.
-        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await account.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
-        Assert.Equal(100, await account.GetConfirmedBalance());
-        Assert.Single(await account.GetEvents()); // only the Truncation event
+        Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        Assert.Single(await account.GetEvents(TestContext.Current.CancellationToken)); // only the Truncation event
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -686,17 +686,17 @@ public sealed class BasicTests : IAsyncLifetime
         var account = cluster.Client.GetGrain<IAccountGrain>(accountId);
         var streamName = streamNameProvider.GetStreamName(account.GetGrainId());
 
-        await account.Deposit(100);
-        await account.Deposit(50);
+        await account.Deposit(100, TestContext.Current.CancellationToken);
+        await account.Deposit(50, TestContext.Current.CancellationToken);
 
         // Make the SetStreamMetadata call throw so the truncation marker is written but $tb is not set.
         kurrentClient.AddSetMetadataExceptionToThrowOnceForTesting(streamName, new Exception("simulated crash after append"));
-        await Assert.ThrowsAsync<InconsistentStateException>(() => account.TruncateAccount());
+        await Assert.ThrowsAsync<InconsistentStateException>(() => account.TruncateAccount(TestContext.Current.CancellationToken));
 
 
         // After self-healing only the Truncation event should contribute to the view (balance = 0).
-        Assert.Equal(150, await account.GetConfirmedBalance());
-        var events = await account.GetEvents();
+        Assert.Equal(150, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+        var events = await account.GetEvents(TestContext.Current.CancellationToken);
         Assert.Single(events);
         Assert.IsType<AccountEvent.Truncation>(events[0]);
     }

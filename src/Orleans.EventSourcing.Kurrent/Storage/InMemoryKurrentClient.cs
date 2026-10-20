@@ -91,7 +91,8 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
             var countToTake = (int)Math.Min(maxCount, int.MaxValue);
             query = query.Take(countToTake);
     
-            return new InMemoryResult(query.Select(x => new ResolvedEvent(x, null, null)).ToAsyncEnumerable(), StreamPosition.FromStreamRevision(checked((ulong)events.Count - 1)));
+            // Materialize while holding singleAccess: the result is enumerated after release, when concurrent appends may be modifying the event list
+            return new InMemoryResult(query.Select(x => new ResolvedEvent(x, null, null)).ToArray().ToAsyncEnumerable(), StreamPosition.FromStreamRevision(checked((ulong)events.Count - 1)));
         }
         finally
         {

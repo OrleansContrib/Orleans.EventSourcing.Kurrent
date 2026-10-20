@@ -65,9 +65,9 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRow_ReturnsNull_WhenReminderDoesNotExist()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
 
-        var result = await table.ReadRow(NewGrainId(), "missing");
+        var result = await table.ReadRow(NewGrainId(), "missing", TestContext.Current.CancellationToken);
 
         Assert.Null(result);
     }
@@ -75,13 +75,14 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRow_ReturnsEntry_AfterUpsert()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
         var startAt = DateTime.UtcNow;
         var period = TimeSpan.FromMinutes(5);
 
-        var etag = await table.UpsertRow(MakeEntry(grainId, "r1", startAt, period));
-        var result = await table.ReadRow(grainId, "r1");
+        var etag = await table.UpsertRow(MakeEntry(grainId, "r1", startAt, period), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag);
+        var result = await table.ReadRow(grainId, "r1", TestContext.Current.CancellationToken);
 
         Assert.NotNull(result);
         Assert.Equal(grainId, result.GrainId);
@@ -96,9 +97,9 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRows_ByGrainId_ReturnsEmptyTable_WhenNoReminders()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
 
-        var result = await table.ReadRows(NewGrainId());
+        var result = await table.ReadRows(NewGrainId(), TestContext.Current.CancellationToken);
 
         Assert.Empty(result.Reminders);
     }
@@ -106,16 +107,16 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRows_ByGrainId_ReturnsOnlyEntriesForThatGrain()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId1 = NewGrainId();
         var grainId2 = NewGrainId();
 
-        await table.UpsertRow(MakeEntry(grainId1, "a"));
-        await table.UpsertRow(MakeEntry(grainId1, "b"));
-        await table.UpsertRow(MakeEntry(grainId2, "c"));
+        await table.UpsertRow(MakeEntry(grainId1, "a"), TestContext.Current.CancellationToken);
+        await table.UpsertRow(MakeEntry(grainId1, "b"), TestContext.Current.CancellationToken);
+        await table.UpsertRow(MakeEntry(grainId2, "c"), TestContext.Current.CancellationToken);
 
-        var result1 = await table.ReadRows(grainId1);
-        var result2 = await table.ReadRows(grainId2);
+        var result1 = await table.ReadRows(grainId1, TestContext.Current.CancellationToken);
+        var result2 = await table.ReadRows(grainId2, TestContext.Current.CancellationToken);
 
         Assert.Equal(2, result1.Reminders.Count);
         Assert.All(result1.Reminders, r => Assert.Equal(grainId1, r.GrainId));
@@ -128,16 +129,16 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRows_ByHashRange_NormalRange_IncludesHashAtEndOfRange()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        await table.UpsertRow(MakeEntry(grainId, "r1"));
+        await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
         var hash = grainId.GetUniformHashCode();
 
         // Normal range (begin < end): hash > begin && hash <= end
         // (hash-1, hash) → includes this grain (hash > hash-1 && hash <= hash)
-        var included = await table.ReadRows(unchecked(hash - 1), hash);
+        var included = await table.ReadRows(unchecked(hash - 1), hash, TestContext.Current.CancellationToken);
         // (hash, hash+1) → excludes this grain (hash > hash is false)
-        var excluded = await table.ReadRows(hash, unchecked(hash + 1));
+        var excluded = await table.ReadRows(hash, unchecked(hash + 1), TestContext.Current.CancellationToken);
 
         Assert.Contains(included.Reminders, r => r.GrainId == grainId);
         Assert.DoesNotContain(excluded.Reminders, r => r.GrainId == grainId);
@@ -146,16 +147,16 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRows_ByHashRange_WrapAround_IncludesHashBelowOrEqualEnd()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        await table.UpsertRow(MakeEntry(grainId, "r1"));
+        await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
         var hash = grainId.GetUniformHashCode();
 
         // Wrap-around range (begin >= end): hash > begin || hash <= end
         // (hash+1, hash) → begin > end → hash > hash+1 is false, hash <= hash is true → includes
-        var included = await table.ReadRows(unchecked(hash + 1), hash);
+        var included = await table.ReadRows(unchecked(hash + 1), hash, TestContext.Current.CancellationToken);
         // (hash, hash-1) → begin > end → hash > hash is false, hash <= hash-1 is false → excludes
-        var excluded = await table.ReadRows(hash, unchecked(hash - 1));
+        var excluded = await table.ReadRows(hash, unchecked(hash - 1), TestContext.Current.CancellationToken);
 
         Assert.Contains(included.Reminders, r => r.GrainId == grainId);
         Assert.DoesNotContain(excluded.Reminders, r => r.GrainId == grainId);
@@ -166,9 +167,10 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task UpsertRow_ReturnsNonEmptyETag()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
 
-        var etag = await table.UpsertRow(MakeEntry(NewGrainId(), "r1"));
+        var etag = await table.UpsertRow(MakeEntry(NewGrainId(), "r1"), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag);
 
         Assert.NotEmpty(etag);
     }
@@ -176,14 +178,16 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task UpsertRow_UpdatesExistingEntry_AndReturnsNewETag()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
 
-        var etag1 = await table.UpsertRow(MakeEntry(grainId, "r1", period: TimeSpan.FromMinutes(1)));
-        var etag2 = await table.UpsertRow(MakeEntry(grainId, "r1", period: TimeSpan.FromMinutes(10), eTag: etag1));
+        var etag1 = await table.UpsertRow(MakeEntry(grainId, "r1", period: TimeSpan.FromMinutes(1)), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag1);
+        var etag2 = await table.UpsertRow(MakeEntry(grainId, "r1", period: TimeSpan.FromMinutes(10), eTag: etag1), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag2);
 
         Assert.NotEqual(etag1, etag2);
-        var result = await table.ReadRow(grainId, "r1");
+        var result = await table.ReadRow(grainId, "r1", TestContext.Current.CancellationToken);
         Assert.NotNull(result);
         Assert.Equal(TimeSpan.FromMinutes(10), result.Period);
         Assert.Equal(etag2, result.ETag);
@@ -192,15 +196,16 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task UpsertRow_Throws_WhenETagIsStale()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
 
-        var etag1 = await table.UpsertRow(MakeEntry(grainId, "r1"));
-        await table.UpsertRow(MakeEntry(grainId, "r1", eTag: etag1)); // advance the etag
+        var etag1 = await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag1);
+        await table.UpsertRow(MakeEntry(grainId, "r1", eTag: etag1), TestContext.Current.CancellationToken); // advance the etag
 
         // etag1 is now stale
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            table.UpsertRow(MakeEntry(grainId, "r1", eTag: etag1)));
+            table.UpsertRow(MakeEntry(grainId, "r1", eTag: etag1), TestContext.Current.CancellationToken));
     }
 
     // RemoveRow tests
@@ -208,9 +213,9 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task RemoveRow_ReturnsFalse_WhenReminderDoesNotExist()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
 
-        var removed = await table.RemoveRow(NewGrainId(), "missing", "any-etag");
+        var removed = await table.RemoveRow(NewGrainId(), "missing", "any-etag", TestContext.Current.CancellationToken);
 
         Assert.False(removed);
     }
@@ -218,36 +223,38 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task RemoveRow_ReturnsTrue_AndDeletesEntry_WhenETagMatches()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        var etag = await table.UpsertRow(MakeEntry(grainId, "r1"));
+        var etag = await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag);
 
-        var removed = await table.RemoveRow(grainId, "r1", etag);
+        var removed = await table.RemoveRow(grainId, "r1", etag, TestContext.Current.CancellationToken);
 
         Assert.True(removed);
-        Assert.Null(await table.ReadRow(grainId, "r1"));
+        Assert.Null(await table.ReadRow(grainId, "r1", TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = Timeout)]
     public async Task RemoveRow_Throws_WhenETagMismatch()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        await table.UpsertRow(MakeEntry(grainId, "r1"));
+        await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            table.RemoveRow(grainId, "r1", "wrong-etag"));
+            table.RemoveRow(grainId, "r1", "wrong-etag", TestContext.Current.CancellationToken));
     }
 
     [Fact(Timeout = Timeout)]
     public async Task RemoveRow_ReturnsFalse_AfterAlreadyRemoved()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        var etag = await table.UpsertRow(MakeEntry(grainId, "r1"));
-        await table.RemoveRow(grainId, "r1", etag);
+        var etag = await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag);
+        await table.RemoveRow(grainId, "r1", etag, TestContext.Current.CancellationToken);
 
-        var removed = await table.RemoveRow(grainId, "r1", etag);
+        var removed = await table.RemoveRow(grainId, "r1", etag, TestContext.Current.CancellationToken);
 
         Assert.False(removed);
     }
@@ -258,13 +265,13 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     public async Task TestOnlyClearTable_RemovesAllReminders()
     {
         var grainId = NewGrainId();
-        await table.UpsertRow(MakeEntry(grainId, "r1"));
-        await table.UpsertRow(MakeEntry(grainId, "r2"));
+        await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
+        await table.UpsertRow(MakeEntry(grainId, "r2"), TestContext.Current.CancellationToken);
 
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
 
         // ReadRows(0, 0): 0 >= 0 → wrap-around → hash > 0 || hash <= 0 covers all uint values
-        var allReminders = await table.ReadRows(0, 0);
+        var allReminders = await table.ReadRows(0, 0, TestContext.Current.CancellationToken);
         Assert.Empty(allReminders.Reminders);
     }
 
@@ -273,15 +280,16 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task StateIsPreserved_AfterGrainDeactivation()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        var etag = await table.UpsertRow(MakeEntry(grainId, "r1", period: TimeSpan.FromMinutes(3)));
+        var etag = await table.UpsertRow(MakeEntry(grainId, "r1", period: TimeSpan.FromMinutes(3)), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag);
 
         var grain = cluster.Client.GetGrain<IReminderTableGrain>(default(IdSpan));
-        await grain.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
+        await grain.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
         // The next read reactivates the grain and replays all committed events from Kurrent.
-        var result = await table.ReadRow(grainId, "r1");
+        var result = await table.ReadRow(grainId, "r1", TestContext.Current.CancellationToken);
 
         Assert.NotNull(result);
         Assert.Equal(grainId, result.GrainId);
@@ -292,21 +300,22 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task UpsertRow_AfterClearTable_Succeeds()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        await table.UpsertRow(MakeEntry(grainId, "before-clear"));
+        await table.UpsertRow(MakeEntry(grainId, "before-clear"), TestContext.Current.CancellationToken);
 
         // ClearedV1 carries [DiscardPriorEvents] which triggers a Kurrent TruncateBefore operation.
         // Subsequent appends must still use the correct ConfirmedVersion.
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
 
-        var etag = await table.UpsertRow(MakeEntry(grainId, "after-clear", period: TimeSpan.FromMinutes(2)));
-        var result = await table.ReadRow(grainId, "after-clear");
+        var etag = await table.UpsertRow(MakeEntry(grainId, "after-clear", period: TimeSpan.FromMinutes(2)), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag);
+        var result = await table.ReadRow(grainId, "after-clear", TestContext.Current.CancellationToken);
 
         Assert.NotNull(result);
         Assert.Equal(TimeSpan.FromMinutes(2), result.Period);
         Assert.Equal(etag, result.ETag);
-        Assert.Null(await table.ReadRow(grainId, "before-clear"));
+        Assert.Null(await table.ReadRow(grainId, "before-clear", TestContext.Current.CancellationToken));
     }
 
     // Multi-reminder and multi-grain tests
@@ -314,17 +323,18 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task RemoveRow_OneOfMultiple_LeavesOtherIntact()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId = NewGrainId();
-        var etag1 = await table.UpsertRow(MakeEntry(grainId, "r1"));
-        await table.UpsertRow(MakeEntry(grainId, "r2"));
+        var etag1 = await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
+        Assert.NotNull(etag1);
+        await table.UpsertRow(MakeEntry(grainId, "r2"), TestContext.Current.CancellationToken);
 
-        await table.RemoveRow(grainId, "r1", etag1);
+        await table.RemoveRow(grainId, "r1", etag1, TestContext.Current.CancellationToken);
 
-        Assert.Null(await table.ReadRow(grainId, "r1"));
-        Assert.NotNull(await table.ReadRow(grainId, "r2"));
+        Assert.Null(await table.ReadRow(grainId, "r1", TestContext.Current.CancellationToken));
+        Assert.NotNull(await table.ReadRow(grainId, "r2", TestContext.Current.CancellationToken));
 
-        var remaining = await table.ReadRows(grainId);
+        var remaining = await table.ReadRows(grainId, TestContext.Current.CancellationToken);
         var single = Assert.Single(remaining.Reminders);
         Assert.Equal("r2", single.ReminderName);
     }
@@ -332,17 +342,17 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     [Fact(Timeout = Timeout)]
     public async Task ReadRows_ByHashRange_WithMultipleGrains_FiltersCorrectly()
     {
-        await table.TestOnlyClearTable();
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
         var grainId1 = NewGrainId();
         var grainId2 = NewGrainId();
-        await table.UpsertRow(MakeEntry(grainId1, "r1"));
-        await table.UpsertRow(MakeEntry(grainId2, "r2"));
+        await table.UpsertRow(MakeEntry(grainId1, "r1"), TestContext.Current.CancellationToken);
+        await table.UpsertRow(MakeEntry(grainId2, "r2"), TestContext.Current.CancellationToken);
 
         var hash1 = grainId1.GetUniformHashCode();
 
         // (hash1-1, hash1] is a one-slot range: includes exactly grainId1 but not grainId2,
         // provided the two grains have different hashes (overwhelmingly likely for random GUIDs).
-        var result = await table.ReadRows(unchecked(hash1 - 1), hash1);
+        var result = await table.ReadRows(unchecked(hash1 - 1), hash1, TestContext.Current.CancellationToken);
 
         Assert.Contains(result.Reminders, r => r.GrainId == grainId1);
         Assert.DoesNotContain(result.Reminders, r => r.GrainId == grainId2);

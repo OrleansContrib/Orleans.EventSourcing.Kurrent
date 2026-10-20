@@ -4,35 +4,24 @@ using Orleans.Configuration;
 using Orleans.EventSourcing.Kurrent.Clustering.Events;
 using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Storage;
-using System.Globalization;
 using System.Text.Json;
 
 namespace Orleans.EventSourcing.Kurrent.Clustering;
 
 // Owns all persistence concerns for membership: Kurrent stream I/O, JSON serialization, stream naming,
-// and the translation between the Kurrent StreamState (the read cursor / optimistic-concurrency token)
-// and the opaque ETag string carried by MembershipView.
+// and tracking the StreamState each MembershipView was read at (its read cursor and optimistic-concurrency token).
 internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOptions<KurrentClusteringOptions> options, IOptions<ClusterOptions> clusterOptions, JsonSerializerOptions jsonSerializerOptions)
 {
     private readonly string streamName = $"{options.Value.StreamPrefix}/{clusterOptions.Value.ServiceId}/{clusterOptions.Value.ClusterId}";
-    private const string NoStreamEtag = "None";
 
-    internal MembershipView InitialView { get; } = new() { ETag = NoStreamEtag };
+    internal MembershipView InitialView { get; } = new() { StreamCursor = StreamState.NoStream };
 
-    private static StreamState ToStreamState(string etag)
-        => etag == NoStreamEtag
-            ? StreamState.NoStream
-            : StreamState.StreamRevision(ulong.Parse(etag, CultureInfo.InvariantCulture));
-
-    private static StreamPosition GetReadStreamPosition(string etag)
-    {
-        var expectedStreamState = ToStreamState(etag);
-        return expectedStreamState == StreamState.NoStream ? StreamPosition.Start : StreamPosition.FromInt64(expectedStreamState.ToInt64()).Next();
-    }
+    private static StreamPosition GetReadStreamPosition(StreamState streamCursor)
+        => streamCursor == StreamState.NoStream ? StreamPosition.Start : StreamPosition.FromInt64(streamCursor.ToInt64()).Next();
     
     internal async Task<MembershipView> RefreshState(MembershipView view, CancellationToken cancellationToken)
     {
-        var readResult = await client.ReadStreamAsync(Direction.Forwards, streamName, GetReadStreamPosition(view.ETag), long.MaxValue, false, cancellationToken).ConfigureAwait(false);
+        var readResult = await client.ReadStreamAsync(Direction.Forwards, streamName, GetReadStreamPosition(view.StreamCursor), long.MaxValue, false, cancellationToken).ConfigureAwait(false);
 
         await foreach (var message in readResult.ConfigureAwait(false))
         {
@@ -51,12 +40,12 @@ internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOpti
                 throw new InvalidOperationException($"Event type {message.Event.EventType} could not be deserialized");
             }
 
-            view = deserializedEvent.Apply(view) with { ETag = message.Event.EventNumber.ToInt64().ToString(CultureInfo.InvariantCulture) };
+            view = deserializedEvent.Apply(view) with { StreamCursor = StreamState.StreamRevision(message.Event.EventNumber.ToUInt64()) };
         }
 
         if (readResult.LastStreamPosition.HasValue)
         {
-            return view with { ETag = readResult.LastStreamPosition.Value.ToInt64().ToString(CultureInfo.InvariantCulture) };
+            return view with { StreamCursor = StreamState.StreamRevision(readResult.LastStreamPosition.Value.ToUInt64()) };
         }
         else
         {
@@ -74,15 +63,15 @@ internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOpti
             updatedView = evt.Apply(updatedView);
         }
 
-        // Write a snapshot of the updated view to the stream, using the ETag for optimistic concurrency
+        // Write a snapshot of the updated view to the stream, using the stream cursor for optimistic concurrency
         if (await client.ConditionalAppendToStreamAsync(streamName,
-                                                        ToStreamState(updatedView.ETag),
+                                                        updatedView.StreamCursor,
                                                         [new EventData(Uuid.NewUuid(), nameof(MembershipTableSnapshot), JsonSerializer.SerializeToUtf8Bytes<MembershipTableSnapshot>(updatedView.GetSnapshot(), jsonSerializerOptions))],
                                                         cancellationToken)
                         .ConfigureAwait(false) is { Status: ConditionalWriteStatus.Succeeded } success)
         {
 
-            // Write the truncation point for the snapshot to the stream, using the ETag for optimistic concurrency            
+            // Write the truncation point for the snapshot to the stream, using the stream cursor for optimistic concurrency            
             var truncationPoint = StreamPosition.FromInt64(success.NextExpectedVersion);
 
             while(true)
@@ -124,7 +113,7 @@ internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOpti
                 break; // Success
             }
         
-            return updatedView with { ETag = success.NextExpectedStreamState.ToString() };
+            return updatedView with { StreamCursor = success.NextExpectedStreamState };
         }
 
         return from;
@@ -145,7 +134,7 @@ internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOpti
       
         var expectedStreamState = writeEvents.All(x => x is SiloDefunct || x is SiloAlive) // These two events are dirty write safe
                                                        ? StreamState.Any 
-                                                       : ToStreamState(from.ETag); // All other events require optimistic concurrency
+                                                       : from.StreamCursor; // All other events require optimistic concurrency
 
         if (await client.ConditionalAppendToStreamAsync(streamName,
                                                         expectedStreamState,
@@ -157,11 +146,11 @@ internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOpti
             {
                 if (expectedStreamState == StreamState.Any)
                 {
-                    from = evt.Apply(from); // Do not update ETag as we may not have observed intermediate events because this write was unconditional
+                    from = evt.Apply(from); // Do not update the stream cursor as we may not have observed intermediate events because this write was unconditional
                 }
                 else
                 {
-                    from = evt.Apply(from) with { ETag = success.NextExpectedStreamState.ToString() };
+                    from = evt.Apply(from) with { StreamCursor = success.NextExpectedStreamState };
                 }
             }
         }       
@@ -169,14 +158,14 @@ internal sealed class KurrentMembershipEventStorage(IKurrentClient client, IOpti
         return from;
     }
 
-    internal async Task<MembershipView> Delete(MembershipView view, string clusterId)
+    internal async Task<MembershipView> Delete(MembershipView view, string clusterId, CancellationToken cancellationToken)
     {
         if (clusterOptions.Value.ClusterId != clusterId)
         { 
             return view;
         }
 
-        _ = await client.DeleteStreamAsync(streamName, StreamState.Any, CancellationToken.None)
+        _ = await client.DeleteStreamAsync(streamName, StreamState.Any, cancellationToken)
                         .ConfigureAwait(false);
 
         return InitialView;

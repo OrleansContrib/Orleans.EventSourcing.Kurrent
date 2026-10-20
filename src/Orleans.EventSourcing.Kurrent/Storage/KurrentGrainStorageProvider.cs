@@ -39,7 +39,11 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     }
 
     /// <inheritdoc/>
-    public async Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+    public Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+        => ClearStateAsync(stateName, grainId, grainState, CancellationToken.None);
+
+    /// <inheritdoc/>
+    public async Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
         if (grainState.RecordExists)
         {
@@ -48,7 +52,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             {
                 try
                 {
-                    _ = await kurrentClient.DeleteStreamAsync(streamNameProvider.GetStreamName(stateName, grainId), streamState, CancellationToken.None).ConfigureAwait(false);
+                    _ = await kurrentClient.DeleteStreamAsync(streamNameProvider.GetStreamName(stateName, grainId), streamState, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -63,7 +67,11 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     }
 
     /// <inheritdoc/>
-    public async Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+    public Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+        => ReadStateAsync(stateName, grainId, grainState, CancellationToken.None);
+
+    /// <inheritdoc/>
+    public async Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
         var observabilityTags = new TagList
         {
@@ -78,9 +86,9 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                                                                   StreamPosition.End,
                                                                   2,
                                                                   false,
-                                                                  CancellationToken.None).ConfigureAwait(false);
+                                                                  cancellationToken).ConfigureAwait(false);
 
-            var enumerator = readResult.GetAsyncEnumerator();
+            var enumerator = readResult.GetAsyncEnumerator(cancellationToken);
             try
             {
                 if (!await enumerator.MoveNextAsync().ConfigureAwait(false))
@@ -101,7 +109,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                 // A second event would indicate the stream metadata wasn't written successfully on the first write
                 if (await enumerator.MoveNextAsync().ConfigureAwait(false))
                 {
-                    await EnsureMetadataMaxCountSet(stateName, CancellationToken.None).ConfigureAwait(false);
+                    await EnsureMetadataMaxCountSet(stateName, cancellationToken).ConfigureAwait(false);
                 }
             }
             finally
@@ -140,7 +148,11 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     }
 
     /// <inheritdoc/>
-    public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+    public Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+        => WriteStateAsync(stateName, grainId, grainState, CancellationToken.None);
+
+    /// <inheritdoc/>
+    public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
         var observabilityTags = new TagList
         {
@@ -153,14 +165,19 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             var streamName = streamNameProvider.GetStreamName(stateName, grainId);
             var expectedStreamState = ConvertETagToStreamState(grainState.ETag);
 
+            if (grainState.State is not { } state)
+            {
+                throw new ArgumentNullException(nameof(grainState), "Grain state cannot be null.");
+            }
+
             var sw = Stopwatch.StartNew();
-            var eventRecord = eventSerializer.GetEventConverter<T>().SerializeEvent(grainState.State);
+            var eventRecord = eventSerializer.GetEventConverter<T>().SerializeEvent(state);
             Metrics.StateSerializationLatency.Record(sw.ElapsedMilliseconds, observabilityTags);
 
             var result = await kurrentClient.ConditionalAppendToStreamAsync(streamName,
                                                                             expectedStreamState,
                                                                             [eventRecord],
-                                                                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                                                                            cancellationToken: cancellationToken).ConfigureAwait(false);
 
             switch (result.Status)
             {
@@ -184,7 +201,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             // We set it to 1, so we only retain the last event
             if (expectedStreamState == StreamState.NoStream)
             {
-                await EnsureMetadataMaxCountSet(streamName, CancellationToken.None).ConfigureAwait(false);
+                await EnsureMetadataMaxCountSet(streamName, cancellationToken).ConfigureAwait(false);
             }
 
             grainState.RecordExists = true;

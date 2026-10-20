@@ -12,6 +12,9 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
      => @event.Event.Apply(state, @event.EventId);
     
     public Task<ReminderEntry?> ReadRow(GrainId grainId, string reminderName)
+        => ReadRow(grainId, reminderName, CancellationToken.None);
+
+    public Task<ReminderEntry?> ReadRow(GrainId grainId, string reminderName, CancellationToken cancellationToken)
     {
         if (TentativeState.Reminders.TryGetValue(grainId, out var remindersForGrain)
             && remindersForGrain.TryGetValue(reminderName, out var reminder))
@@ -23,6 +26,9 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
     }
 
     public Task<ReminderTableData> ReadRows(GrainId grainId)
+        => ReadRows(grainId, CancellationToken.None);
+
+    public Task<ReminderTableData> ReadRows(GrainId grainId, CancellationToken cancellationToken)
     {
         if (TentativeState.Reminders.TryGetValue(grainId, out var remindersForGrain))
         {
@@ -35,6 +41,9 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
     }
 
     public Task<ReminderTableData> ReadRows(uint begin, uint end)
+        => ReadRows(begin, end, CancellationToken.None);
+
+    public Task<ReminderTableData> ReadRows(uint begin, uint end, CancellationToken cancellationToken)
     {
         return Task.FromResult(new ReminderTableData(TentativeState.Reminders.Values.SelectMany(x => x)
                                                            .Where(x =>
@@ -51,7 +60,10 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
                                                                  }))); 
     }
 
-    public async Task<bool> RemoveRow(GrainId grainId, string reminderName, string eTag)
+    public Task<bool> RemoveRow(GrainId grainId, string reminderName, string eTag)
+        => RemoveRow(grainId, reminderName, eTag, CancellationToken.None);
+
+    public async Task<bool> RemoveRow(GrainId grainId, string reminderName, string eTag, CancellationToken cancellationToken)
     {
         if (!TentativeState.Reminders.TryGetValue(grainId, out var reminderCollection)
          || !reminderCollection.TryGetValue(reminderName, out var reminderEntry))
@@ -69,9 +81,14 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
         return true;
     }
 
-    public Task TestOnlyClearTable() => Commit(Guid.NewGuid(), new ClearedV1());    
+    public Task TestOnlyClearTable() => TestOnlyClearTable(CancellationToken.None);
 
-    public async Task<string> UpsertRow(ReminderEntry entry)
+    public Task TestOnlyClearTable(CancellationToken cancellationToken) => Commit(Guid.NewGuid(), new ClearedV1());
+
+    public Task<string?> UpsertRow(ReminderEntry entry)
+        => UpsertRow(entry, CancellationToken.None);
+
+    public async Task<string?> UpsertRow(ReminderEntry entry, CancellationToken cancellationToken)
     {
         if (TentativeState.Reminders.TryGetValue(entry.GrainId, out var reminderCollection)
         && reminderCollection.TryGetValue(entry.ReminderName, out var existingRetry)

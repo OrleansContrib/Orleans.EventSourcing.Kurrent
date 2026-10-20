@@ -16,6 +16,7 @@
 		<ItemGroup>
 			<PackageReference Include="KurrentDB.Client" />
 			<PackageReference Include="Microsoft.Orleans.Reminders" />
+			<PackageReference Include="Microsoft.Orleans.Sdk" />
 			<PackageReference Include="OpenTelemetry.Api" />
 		</ItemGroup>
 		<ItemGroup>
