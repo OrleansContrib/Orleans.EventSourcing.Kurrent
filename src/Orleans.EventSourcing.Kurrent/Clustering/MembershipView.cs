@@ -1,22 +1,26 @@
 using System.Collections.Immutable;
+using System.Globalization;
+using KurrentDB.Client;
 using Orleans.EventSourcing.Kurrent.Clustering.Events;
 
 namespace Orleans.EventSourcing.Kurrent.Clustering;
 
 // The materialized membership state as of a specific stream position.
-// It carries both halves of the Orleans optimistic-concurrency token: the domain Version
-// and the ETag (derived from the stream position by storage).
-// The ETag is stored as an opaque string so this domain type stays free of any Kurrent client types;
-// KurrentMembershipEventStorage owns the StreamState <-> ETag translation.
+// The Orleans table ETag is derived from the domain Version, which only canonical writes (insert/update) advance,
+// so heartbeats and defunct-entry cleanup leave it unchanged.
+// The StreamCursor is the stream state this view was read at, which KurrentMembershipEventStorage uses
+// as the read position and optimistic-concurrency token.
 internal sealed record MembershipView
 {
     public ImmutableDictionary<SiloAddress, ImmutableMembership> Members { get; init; } = ImmutableDictionary<SiloAddress, ImmutableMembership>.Empty;
 
     public int Version { get; init; }
 
-    public string ETag { get; init; } = string.Empty;
+    public StreamState StreamCursor { get; init; } = StreamState.NoStream;
 
-    private TableVersion ToTableVersion() => new(Version, ETag);
+    public string TableETag => Version.ToString(CultureInfo.InvariantCulture);
+
+    private TableVersion ToTableVersion() => new(Version, TableETag);
 
     internal MembershipTableData ReadAll() => new([.. Members.Select(x => x.Value.ToMembershipEntry())], ToTableVersion());
 
@@ -36,7 +40,7 @@ internal sealed record MembershipView
            }
            : this;
 
-    // A snapshot is a full checkpoint: it replaces the members and version wholesale while keeping the current ETag,
+    // A snapshot is a full checkpoint: it replaces the members and version wholesale while keeping the current StreamCursor,
     // which storage overwrites with the actual stream position after the read/write completes.
     internal MembershipView Apply(MembershipTableSnapshot snapshotEvent)
         => this with { Members = snapshotEvent.Members,
@@ -67,7 +71,7 @@ internal sealed record MembershipView
             yield break;
         }
 
-        yield return new SiloStateUpdated(entry.SiloAddress, entry.Status, Guid.NewGuid().ToString(), entry.SuspectTimes.ToImmutableDictionary(x => x.Item1, x => x.Item2), tableVersion);
+        yield return new SiloStateUpdated(entry.SiloAddress, entry.Status, Guid.NewGuid().ToString(), entry.SuspectTimes?.ToImmutableDictionary(x => x.Item1, x => x.Item2) ?? ImmutableDictionary<SiloAddress, DateTime>.Empty, tableVersion);
     }
 
     internal IEnumerable<EventBase> InsertRow(MembershipEntry entry, int tableVersion)
@@ -91,16 +95,30 @@ internal sealed record MembershipView
         yield return new SiloAlive(entry.SiloAddress, updateEntry.IAmAliveTime);
     }
 
+    // Only rows the membership protocol has already declared Dead are eligible; cleanup never decides a silo's fate.
+    // A row is defunct once its most recent activity (start, heartbeat or suspicion vote) is strictly before the cutoff.
     internal IEnumerable<EventBase> CleanUpDefunctEntries(DateTimeOffset beforeDate)
-    {  
+    {
         foreach (var item in Members)
         {
-            if (item.Value.Status != SiloStatus.Active &&
-                new DateTime(Math.Max(item.Value.IAmAliveTime.Ticks, item.Value.StartTime.Ticks), DateTimeKind.Utc) < beforeDate)
+            if (item.Value.Status == SiloStatus.Dead &&
+                GetLastActivityTime(item.Value) < beforeDate)
             {
                 yield return new SiloDefunct(item.Key);
             }
-        }  
+        }
+    }
+
+    private static DateTime GetLastActivityTime(ImmutableMembership membership)
+    {
+        var lastActivityTicks = Math.Max(membership.IAmAliveTime.Ticks, membership.StartTime.Ticks);
+
+        foreach (var suspectTime in membership.SuspectTimes.Values)
+        {
+            lastActivityTicks = Math.Max(lastActivityTicks, suspectTime.Ticks);
+        }
+
+        return new DateTime(lastActivityTicks, DateTimeKind.Utc);
     }
 
     internal MembershipView Apply(SiloDefunct siloDefunct)

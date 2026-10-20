@@ -3,5 +3,5 @@
 namespace Orleans.EventSourcing.Kurrent.Reminders;
 
 [Alias("Orleans.EventSourcing.Reminders.IReminderTableGrain")]
-[Version(0)]
+[Version(1)]
 internal interface IReminderTableGrain : IGrain, IReminderTable;

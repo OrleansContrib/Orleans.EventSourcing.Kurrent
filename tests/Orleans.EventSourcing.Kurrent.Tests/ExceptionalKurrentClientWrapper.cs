@@ -10,13 +10,23 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
 {
     readonly ConcurrentDictionary<string, Exception> dictionaryExceptionToThrowOnceForTesting = new();
     readonly ConcurrentDictionary<string, Exception> setMetadataExceptionToThrowOnce = new();
+    readonly ConcurrentDictionary<string, CancellationTokenSource> cancelOnceForTesting = new();
 
     internal void AddExceptionToThrowOnceForTesting(string streamName, Exception exception) => dictionaryExceptionToThrowOnceForTesting.AddOrUpdate(streamName, exception, (k, v) => v = exception);
 
     internal void AddSetMetadataExceptionToThrowOnceForTesting(string streamName, Exception exception) => setMetadataExceptionToThrowOnce.AddOrUpdate(streamName, exception, (k, v) => v = exception);
 
+    // Simulates the caller's token firing while the next call for the stream is in flight
+    internal void CancelOnceForTesting(string streamName, CancellationTokenSource cancellation) => cancelOnceForTesting.AddOrUpdate(streamName, cancellation, (k, v) => v = cancellation);
+
     private void ThrowIfException(string streamName)
     {
+        if (cancelOnceForTesting.Remove(streamName, out var cancellation))
+        {
+            cancellation.Cancel();
+            throw new OperationCanceledException(cancellation.Token);
+        }
+
         if (dictionaryExceptionToThrowOnceForTesting.Remove(streamName, out var ex))
         {
             throw ex;

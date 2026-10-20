@@ -32,7 +32,8 @@ internal sealed class DefaultProtocolServices(
     public string MyClusterId { get; } = siloDetails.ClusterId;
 
     /// <inheritdoc />
-    public T DeepCopy<T>(T value) => deepCopier.Copy(value);
+    // DeepCopier.Copy only returns null when given null, in which case value is returned as-is
+    public T DeepCopy<T>(T value) => deepCopier.Copy(value) ?? value;
 
     /// <inheritdoc />
     public void ProtocolError(string msg, bool throwexception)

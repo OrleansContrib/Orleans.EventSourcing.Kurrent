@@ -12,6 +12,9 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
      => @event.Event.Apply(state, @event.EventId);
     
     public Task<ReminderEntry?> ReadRow(GrainId grainId, string reminderName)
+        => ReadRow(grainId, reminderName, CancellationToken.None);
+
+    public Task<ReminderEntry?> ReadRow(GrainId grainId, string reminderName, CancellationToken cancellationToken)
     {
         if (TentativeState.Reminders.TryGetValue(grainId, out var remindersForGrain)
             && remindersForGrain.TryGetValue(reminderName, out var reminder))
@@ -23,6 +26,9 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
     }
 
     public Task<ReminderTableData> ReadRows(GrainId grainId)
+        => ReadRows(grainId, CancellationToken.None);
+
+    public Task<ReminderTableData> ReadRows(GrainId grainId, CancellationToken cancellationToken)
     {
         if (TentativeState.Reminders.TryGetValue(grainId, out var remindersForGrain))
         {
@@ -35,6 +41,9 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
     }
 
     public Task<ReminderTableData> ReadRows(uint begin, uint end)
+        => ReadRows(begin, end, CancellationToken.None);
+
+    public Task<ReminderTableData> ReadRows(uint begin, uint end, CancellationToken cancellationToken)
     {
         return Task.FromResult(new ReminderTableData(TentativeState.Reminders.Values.SelectMany(x => x)
                                                            .Where(x =>
@@ -51,7 +60,10 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
                                                                  }))); 
     }
 
-    public async Task<bool> RemoveRow(GrainId grainId, string reminderName, string eTag)
+    public Task<bool> RemoveRow(GrainId grainId, string reminderName, string eTag)
+        => RemoveRow(grainId, reminderName, eTag, CancellationToken.None);
+
+    public async Task<bool> RemoveRow(GrainId grainId, string reminderName, string eTag, CancellationToken cancellationToken)
     {
         if (!TentativeState.Reminders.TryGetValue(grainId, out var reminderCollection)
          || !reminderCollection.TryGetValue(reminderName, out var reminderEntry))
@@ -64,14 +76,19 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
             throw new InvalidOperationException($"Failed to remove reminder {reminderName} for grain {grainId} because state was modified concurrently. Please retry.");
         }
 
-        await Commit(Guid.NewGuid(), new RemovedV1(reminderEntry.GrainId, reminderEntry.ReminderName)).ConfigureAwait(true);
+        await Commit(Guid.NewGuid(), new RemovedV1(reminderEntry.GrainId, reminderEntry.ReminderName), cancellationToken).ConfigureAwait(true);
 
         return true;
     }
 
-    public Task TestOnlyClearTable() => Commit(Guid.NewGuid(), new ClearedV1());    
+    public Task TestOnlyClearTable() => TestOnlyClearTable(CancellationToken.None);
 
-    public async Task<string> UpsertRow(ReminderEntry entry)
+    public Task TestOnlyClearTable(CancellationToken cancellationToken) => Commit(Guid.NewGuid(), new ClearedV1(), cancellationToken);
+
+    public Task<string?> UpsertRow(ReminderEntry entry)
+        => UpsertRow(entry, CancellationToken.None);
+
+    public async Task<string?> UpsertRow(ReminderEntry entry, CancellationToken cancellationToken)
     {
         if (TentativeState.Reminders.TryGetValue(entry.GrainId, out var reminderCollection)
         && reminderCollection.TryGetValue(entry.ReminderName, out var existingRetry)
@@ -81,12 +98,15 @@ internal sealed class KurrentReminderTableGrain : JournaledGrain<KurrentReminder
         }
 
         var eventId = Guid.NewGuid();
-        await Commit(eventId, new UpsertedV1(entry.GrainId, entry.ReminderName, entry.StartAt, entry.Period)).ConfigureAwait(true);
+        await Commit(eventId, new UpsertedV1(entry.GrainId, entry.ReminderName, entry.StartAt, entry.Period), cancellationToken).ConfigureAwait(true);
         return eventId.ToString("N");
     }
 
-    private Task Commit(Guid eventId, ReminderEvent reminderEvent)
+    private Task Commit(Guid eventId, ReminderEvent reminderEvent, CancellationToken cancellationToken)
     {
+        // Cancellation is only honoured before the event is raised: once queued, the append proceeds,
+        // and confirmation must be awaited so a failed write surfaces as InconsistentStateException and triggers recovery
+        cancellationToken.ThrowIfCancellationRequested();
         RaiseEvent(new EventEnvelope<ReminderEvent>(eventId, reminderEvent));
         return ConfirmEvents();
     }

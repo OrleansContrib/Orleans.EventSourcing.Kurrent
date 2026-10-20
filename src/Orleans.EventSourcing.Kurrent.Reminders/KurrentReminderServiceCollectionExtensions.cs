@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Options;
 using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Hosting;
+using Orleans.Storage;
 
 namespace Orleans.EventSourcing.Kurrent.Reminders;
 
@@ -37,7 +38,7 @@ public static class KurrentReminderServiceCollectionExtensions
         siloBuilder.AddKurrentBasedLogConsistencyProvider(LOG_PROVIDER_NAME, configureOptions);
         siloBuilder.Services.AddKurrentReminderService(options =>
         {
-            options.Configure(x => x.GrainStorageSerializer = new SystemTextJsonGrainStorageSerializer());
+            options.Configure<IServiceProvider>((x, sp) => x.GrainStorageSerializer = ActivatorUtilities.CreateInstance<SystemTextJsonGrainStorageSerializer>(sp));
             options.Configure(configureOptions);
         });
         return siloBuilder;

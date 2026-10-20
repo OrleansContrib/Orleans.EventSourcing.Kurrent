@@ -16,7 +16,7 @@ using System.Collections.Immutable;
 
 namespace Orleans.EventSourcing.Kurrent.Projections;
 
-internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grainInterfaceTypeResolver, GrainInterfaceTypeToGrainTypeResolver grainInterfaceTypeToGrainTypeResolver, TypeConverter typeConverter, IKurrentClient kurrentClient, IEventConverterFactory eventSerializerFactory, IKurrentStreamNameProvider streamNameProvider, ILogger<KurrentGrainEventProvider> logger) : IGrainEventProvider
+internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grainInterfaceTypeResolver, GrainInterfaceTypeToGrainTypeResolver grainInterfaceTypeToGrainTypeResolver, TypeConverter typeConverter, IKurrentClient kurrentClient, IEventConverterFactory eventSerializerFactory, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics, ILogger<KurrentGrainEventProvider> logger) : IGrainEventProvider
 {
     const uint ALL_STREAM_CHECKPOINT_INTERVAL = 10_000; // The interval of AllStreamCheckpointReached
 
@@ -64,7 +64,7 @@ internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grain
         };
 
         logger.Subscribe(subscriber, startingPosition, eventFilter);
-        Metrics.CatchUpLive.Record(0, observabilityTags);
+        metrics.CatchUpLive.Record(0, observabilityTags);
 
         await foreach (var message in kurrentClient.CatchUpSubscription(startingPosition.ToAllPosition(), eventFilter, ALL_STREAM_CHECKPOINT_INTERVAL, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(true))
         {
@@ -85,13 +85,13 @@ internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grain
 
                         var stopwatch = Stopwatch.StartNew();
                         var deserializedEvent = eventSerializer.DeserializeEvent(eventMessage.ResolvedEvent);
-                        Metrics.EventDeserializationLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                        metrics.EventDeserializationLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
 
                         logger.EventReceived(subscriber, eventMessage.ResolvedEvent.OriginalPosition, grainId, eventMessage.ResolvedEvent.OriginalEventNumber, deserializedEvent);
-                        Metrics.CatchupEventsProcessed.Add(1, eventTags);
+                        metrics.CatchupEventsProcessed.Add(1, eventTags);
                         stopwatch.Restart();
                         yield return new GrainEvent<TEventBase>(eventMessage.ResolvedEvent.OriginalPosition!.Value.ToGlobalEventLogPosition(), deserializedEvent.Event, grainId, eventMessage.ResolvedEvent.OriginalEventNumber.ToVersion(), deserializedEvent.EventId, deserializedEvent.Metadata?.AsReadOnly() ?? (IReadOnlyDictionary<string,string>)ImmutableDictionary<string,string>.Empty);
-                        Metrics.CatchupEventYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                        metrics.CatchupEventYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
                     }
                     else
                     {
@@ -102,33 +102,33 @@ internal sealed class KurrentGrainEventProvider(GrainInterfaceTypeResolver grain
                         }
                         eventTags.Add("EventType", eventMessage.ResolvedEvent.Event.EventType);
                         logger.EventNotificationReceived(subscriber, eventMessage.ResolvedEvent.OriginalPosition, grainId, eventMessage.ResolvedEvent.OriginalEventNumber);
-                        Metrics.CatchUpNotificationsProcessed.Add(1, eventTags);
+                        metrics.CatchUpNotificationsProcessed.Add(1, eventTags);
 
                         var stopwatch = Stopwatch.StartNew();
                         yield return new GrainEventNotification(eventMessage.ResolvedEvent.OriginalPosition!.Value.ToGlobalEventLogPosition(), grainId, eventMessage.ResolvedEvent.OriginalEventNumber.ToVersion(), eventMessage.ResolvedEvent.Event.EventId.ToGuid());
-                        Metrics.CatchupNotificationYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
+                        metrics.CatchupNotificationYieldLatency.Record(stopwatch.ElapsedMilliseconds, eventTags);
                     }
                     break;
                 case StreamMessage.AllStreamCheckpointReached checkpoint:
 
                     logger.Checkpoint(subscriber, checkpoint.Position);
-                    Metrics.CatchUpCheckpoints.Add(1, observabilityTags);
+                    metrics.CatchUpCheckpoints.Add(1, observabilityTags);
 
                     var checkpointYieldTime = Stopwatch.StartNew();
                     yield return new Checkpoint(checkpoint.Position.ToGlobalEventLogPosition());
-                    Metrics.CatchupCheckpointYieldLatency.Record(checkpointYieldTime.ElapsedMilliseconds, observabilityTags);
+                    metrics.CatchupCheckpointYieldLatency.Record(checkpointYieldTime.ElapsedMilliseconds, observabilityTags);
                     break;
                 case StreamMessage.CaughtUp:
 
                     logger.SubscriptionCaughtUp(subscriber);
-                    Metrics.CatchUpLive.Record(1, observabilityTags);
+                    metrics.CatchUpLive.Record(1, observabilityTags);
 
                     yield return CaughtUp.Instance;
                     break;
                 case StreamMessage.FellBehind:
 
                     logger.SubscriptionFellBehind(subscriber);
-                    Metrics.CatchUpLive.Record(0, observabilityTags);
+                    metrics.CatchUpLive.Record(0, observabilityTags);
 
                     yield return FallenBehind.Instance;
                     break;

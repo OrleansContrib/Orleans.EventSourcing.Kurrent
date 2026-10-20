@@ -1,9 +1,12 @@
+using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Text;
 
 using KurrentDB.Client;
 
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Orleans.EventSourcing.Kurrent.Observability;
 using Orleans.EventSourcing.Kurrent.Storage;
 using Orleans.Storage;
 
@@ -272,7 +275,11 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                    client,
                    serializer ?? new TestEventSerializer(),
                    services,
-                   streamNameProvider);
+                   streamNameProvider,
+                   Metrics);
+
+        // The same default IMeterFactory that Orleans registers for silos and clients
+        private static readonly KurrentMetrics Metrics = new(new ServiceCollection().AddMetrics().BuildServiceProvider().GetRequiredService<IMeterFactory>());
 
         private sealed class TestLogViewAdaptorHost : ILogViewAdaptorHost<TestView, TestLogEntry>
         {

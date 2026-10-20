@@ -6,24 +6,36 @@ internal sealed class KurrentMembershipTable(KurrentMembershipEventStorage stora
 {
     private volatile MembershipView current = storage.InitialView;
 
-    public async Task DeleteMembershipTableEntries(string clusterId)
-     => current = await storage.Delete(current, clusterId).ConfigureAwait(false);
+    public Task DeleteMembershipTableEntries(string clusterId)
+     => DeleteMembershipTableEntriesAsync(clusterId, CancellationToken.None);
+
+    public async Task DeleteMembershipTableEntriesAsync(string clusterId, CancellationToken cancellationToken)
+     => current = await storage.Delete(current, clusterId, cancellationToken).ConfigureAwait(false);
 
     public Task InitializeMembershipTable(bool tryInitTableVersion)
+     => InitializeMembershipTableAsync(tryInitTableVersion, CancellationToken.None);
+
+    public Task InitializeMembershipTableAsync(bool tryInitTableVersion, CancellationToken cancellationToken)
      => Task.CompletedTask;
 
     public Task<bool> InsertRow(MembershipEntry entry, TableVersion tableVersion)
-     => TryChange(tableVersion.VersionEtag, x => x.InsertRow(entry, tableVersion.Version), CancellationToken.None);
+     => InsertRowAsync(entry, tableVersion, CancellationToken.None);
+
+    public Task<bool> InsertRowAsync(MembershipEntry entry, TableVersion tableVersion, CancellationToken cancellationToken)
+     => TryChange(tableVersion.VersionEtag, x => x.InsertRow(entry, tableVersion.Version), cancellationToken);
 
     public Task<bool> UpdateRow(MembershipEntry entry, string etag, TableVersion tableVersion)
-     => TryChange(tableVersion.VersionEtag, x => x.UpdateRow(entry, etag, tableVersion.Version), CancellationToken.None);
+     => UpdateRowAsync(entry, etag, tableVersion, CancellationToken.None);
+
+    public Task<bool> UpdateRowAsync(MembershipEntry entry, string etag, TableVersion tableVersion, CancellationToken cancellationToken)
+     => TryChange(tableVersion.VersionEtag, x => x.UpdateRow(entry, etag, tableVersion.Version), cancellationToken);
 
     private async Task<bool> TryChange(string tableVersionEtag, Func<MembershipView, IEnumerable<EventBase>> action, CancellationToken cancellationToken)
     {
-        var refreshed = await storage.RefreshState(current, CancellationToken.None).ConfigureAwait(false);
+        var refreshed = await storage.RefreshState(current, cancellationToken).ConfigureAwait(false);
         current = refreshed;
 
-        if (tableVersionEtag == refreshed.ETag &&
+        if (tableVersionEtag == refreshed.TableETag &&
             action(refreshed) is { } emittedEvent)
         {
             var updated = await storage.Write(refreshed, emittedEvent, cancellationToken).ConfigureAwait(true);
@@ -38,34 +50,46 @@ internal sealed class KurrentMembershipTable(KurrentMembershipEventStorage stora
         return false;
     }
 
-    public async Task<MembershipTableData> ReadAll()
+    public Task<MembershipTableData> ReadAll()
+     => ReadAllAsync(CancellationToken.None);
+
+    public async Task<MembershipTableData> ReadAllAsync(CancellationToken cancellationToken)
     {
-        var refreshed = await storage.RefreshState(current, CancellationToken.None).ConfigureAwait(false);
+        var refreshed = await storage.RefreshState(current, cancellationToken).ConfigureAwait(false);
         current = refreshed;
         return refreshed.ReadAll();
     }
 
-    public async Task<MembershipTableData> ReadRow(SiloAddress key)
+    public Task<MembershipTableData> ReadRow(SiloAddress key)
+     => ReadRowAsync(key, CancellationToken.None);
+
+    public async Task<MembershipTableData> ReadRowAsync(SiloAddress key, CancellationToken cancellationToken)
     {
-        var refreshed = await storage.RefreshState(current, CancellationToken.None).ConfigureAwait(false);
+        var refreshed = await storage.RefreshState(current, cancellationToken).ConfigureAwait(false);
         current = refreshed;
         return refreshed.ReadRow(key);
     }
 
-    public async Task UpdateIAmAlive(MembershipEntry entry)
+    public Task UpdateIAmAlive(MembershipEntry entry)
+     => UpdateIAmAliveAsync(entry, CancellationToken.None);
+
+    public async Task UpdateIAmAliveAsync(MembershipEntry entry, CancellationToken cancellationToken)
     {
-        var refreshed = await storage.RefreshState(current, CancellationToken.None).ConfigureAwait(false);
+        var refreshed = await storage.RefreshState(current, cancellationToken).ConfigureAwait(false);
         current = refreshed;
 
         if (refreshed.UpdateIAmAlive(entry) is { } emittedEvent)
         {
-            current = await storage.Write(refreshed, emittedEvent, CancellationToken.None).ConfigureAwait(true);
+            current = await storage.Write(refreshed, emittedEvent, cancellationToken).ConfigureAwait(true);
         }
     }
 
-    public async Task CleanupDefunctSiloEntries(DateTimeOffset beforeDate)
+    public Task CleanupDefunctSiloEntries(DateTimeOffset beforeDate)
+     => CleanupDefunctSiloEntriesAsync(beforeDate, CancellationToken.None);
+
+    public async Task CleanupDefunctSiloEntriesAsync(DateTimeOffset beforeDate, CancellationToken cancellationToken)
     {
-        var refreshed = await storage.RefreshState(current, CancellationToken.None).ConfigureAwait(false);
-        current = await storage.Write(refreshed, refreshed.CleanUpDefunctEntries(beforeDate), CancellationToken.None).ConfigureAwait(true);
+        var refreshed = await storage.RefreshState(current, cancellationToken).ConfigureAwait(false);
+        current = await storage.Write(refreshed, refreshed.CleanUpDefunctEntries(beforeDate), cancellationToken).ConfigureAwait(true);
     }
 }

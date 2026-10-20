@@ -7,6 +7,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Microsoft.Orleans.TestingHost" />
+    <PackageReference Include="Microsoft.Orleans.Clustering.TestKit" />
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio" />
   </ItemGroup>
@@ -16,5 +17,9 @@
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <!-- Microsoft.Orleans.Clustering.TestKit's net8.0 build needs System.Collections.Immutable 10.0 but does not declare the dependency. -->
+    <PackageReference Include="System.Collections.Immutable" />
   </ItemGroup>
 </Project>

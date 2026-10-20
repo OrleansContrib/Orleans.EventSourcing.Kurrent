@@ -5,6 +5,7 @@ using Orleans.Configuration;
 using Orleans.EventSourcing.Kurrent.Clustering;
 using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.LogConsistency;
+using Orleans.EventSourcing.Kurrent.Observability;
 using Orleans.EventSourcing.Kurrent.Projections;
 using Orleans.EventSourcing.Kurrent.Storage;
 using Orleans.Providers;
@@ -80,6 +81,9 @@ internal static class ServiceCollectionExtensions
         services.TryAddKeyedSingleton(name, (sp, _) => KurrentClientFactory.Create(sp, name));
         services.TryAddKeyedSingleton(typeof(DefaultEventConverter<>), name, typeof(DefaultEventConverter<>));
         services.TryAddKeyedSingleton<IEventConverterFactory>(name, (serviceProvider, _) => ActivatorUtilities.CreateInstance<EventConverterFactory>(serviceProvider, name));
+
+        // Orleans registers IMeterFactory for every silo and client
+        services.TryAddSingleton<KurrentMetrics>();
     }
 
     internal static void AddKurrentBasedMembershipTable(this IServiceCollection services, Action<OptionsBuilder<KurrentClusteringOptions>>? configureOptions = null)

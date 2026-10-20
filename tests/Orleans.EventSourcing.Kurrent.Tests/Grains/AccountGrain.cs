@@ -57,40 +57,40 @@ namespace Orleans.EventSourcing.Kurrent.Tests.Grains
     interface IAccountGrain : IGrainWithGuidKey
     {
         [Alias("Withdraw")]
-        Task<bool> Withdraw(decimal amount);
+        Task<bool> Withdraw(decimal amount, CancellationToken cancellationToken = default);
         [Alias("Deposit")]
-        Task Deposit(decimal amount);
+        Task Deposit(decimal amount, CancellationToken cancellationToken = default);
         [Alias("DepositWithEventId")]
-        Task Deposit(decimal amount, Guid eventId);
+        Task Deposit(decimal amount, Guid eventId, CancellationToken cancellationToken = default);
         [Alias("DepositWithoutConfirm")]
-        ValueTask DepositWithoutConfirm(decimal amount);
+        ValueTask DepositWithoutConfirm(decimal amount, CancellationToken cancellationToken = default);
         [Alias("TruncateAccountWithoutConfirm")]
-        ValueTask TruncateAccountWithoutConfirm();
+        ValueTask TruncateAccountWithoutConfirm(CancellationToken cancellationToken = default);
         [Alias("ConfirmPendingEvents")]
-        Task ConfirmPendingEvents();
+        Task ConfirmPendingEvents(CancellationToken cancellationToken = default);
         [Alias("GetConfirmedBalance")]
-        ValueTask<decimal> GetConfirmedBalance();
+        ValueTask<decimal> GetConfirmedBalance(CancellationToken cancellationToken = default);
         [Alias("GetTentativeBalance")]
-        ValueTask<decimal> GetTentativeBalance();
+        ValueTask<decimal> GetTentativeBalance(CancellationToken cancellationToken = default);
         [Alias("RefreshNow")]
-        Task RefreshNow();
+        Task RefreshNow(CancellationToken cancellationToken = default);
         [Alias("CloseAccount")]
-        Task<decimal> CloseAccount();
+        Task<decimal> CloseAccount(CancellationToken cancellationToken = default);
         [Alias("GetEvents")]
-        Task<IReadOnlyList<AccountEvent>> GetEvents();
+        Task<IReadOnlyList<AccountEvent>> GetEvents(CancellationToken cancellationToken = default);
         [Alias("GetEventAtVersion")]
-        Task<AccountEvent?> GetEventAtVersion(int version);
+        Task<AccountEvent?> GetEventAtVersion(int version, CancellationToken cancellationToken = default);
         [Alias("GetConfirmedVersion")]
-        Task<int> GetConfirmedVersion();
+        Task<int> GetConfirmedVersion(CancellationToken cancellationToken = default);
         [Alias("ClearLog")]
-        Task ClearLog();
+        Task ClearLog(CancellationToken cancellationToken = default);
         [Alias("TruncateAccount")]
-        Task TruncateAccount();
+        Task TruncateAccount(CancellationToken cancellationToken = default);
     }
 
     internal class AccountGrain : JournaledGrain<AccountState, AccountEvent>, IAccountGrain
     {
-        public async Task<decimal> CloseAccount()
+        public async Task<decimal> CloseAccount(CancellationToken cancellationToken)
         {
             var finalBalance = State.Balance;
             base.RaiseEvents<AccountEvent>([new AccountEvent.Withdrawn(finalBalance), new AccountEvent.Closed(),]);
@@ -98,48 +98,48 @@ namespace Orleans.EventSourcing.Kurrent.Tests.Grains
             return finalBalance;
         }
 
-        public async Task Deposit(decimal amount)
+        public async Task Deposit(decimal amount, CancellationToken cancellationToken)
         {
             RaiseEvent(new AccountEvent.Deposited(amount) { EventId = Guid.NewGuid(), });
             await ConfirmEvents();
         }
 
-        public async Task Deposit(decimal amount, Guid eventId)
+        public async Task Deposit(decimal amount, Guid eventId, CancellationToken cancellationToken)
         {
             RaiseEvent(new AccountEvent.Deposited(amount) { EventId = eventId, });
             await ConfirmEvents();
         }
 
-        public ValueTask DepositWithoutConfirm(decimal amount)
+        public ValueTask DepositWithoutConfirm(decimal amount, CancellationToken cancellationToken)
         {
             RaiseEvent(new AccountEvent.Deposited(amount) { EventId = Guid.NewGuid(), });
             return ValueTask.CompletedTask;
         }
 
-        public ValueTask TruncateAccountWithoutConfirm()
+        public ValueTask TruncateAccountWithoutConfirm(CancellationToken cancellationToken)
         {
             RaiseEvent(new AccountEvent.Truncation(State.Balance));
             return ValueTask.CompletedTask;
         }
 
-        public Task ConfirmPendingEvents() => ConfirmEvents();
+        public Task ConfirmPendingEvents(CancellationToken cancellationToken) => ConfirmEvents();
 
-        public ValueTask<decimal> GetConfirmedBalance() => ValueTask.FromResult(State.Balance);
+        public ValueTask<decimal> GetConfirmedBalance(CancellationToken cancellationToken) => ValueTask.FromResult(State.Balance);
 
-        public ValueTask<decimal> GetTentativeBalance() => ValueTask.FromResult(TentativeState.Balance);
+        public ValueTask<decimal> GetTentativeBalance(CancellationToken cancellationToken) => ValueTask.FromResult(TentativeState.Balance);
 
-        public new Task RefreshNow() =>
+        public Task RefreshNow(CancellationToken cancellationToken) =>
             // call base class RefreshNow directly (bypass protected definition)
             base.RefreshNow();
 
-        public Task<IReadOnlyList<AccountEvent>> GetEvents() => base.RetrieveConfirmedEvents(0, this.Version);
+        public Task<IReadOnlyList<AccountEvent>> GetEvents(CancellationToken cancellationToken) => base.RetrieveConfirmedEvents(0, this.Version);
 
-        public async Task<AccountEvent?> GetEventAtVersion(int version) =>
+        public async Task<AccountEvent?> GetEventAtVersion(int version, CancellationToken cancellationToken) =>
             (await base.RetrieveConfirmedEvents(version, version)).FirstOrDefault();
 
-        public Task<int> GetConfirmedVersion() => Task.FromResult(this.Version);
+        public Task<int> GetConfirmedVersion(CancellationToken cancellationToken) => Task.FromResult(this.Version);
 
-        public async Task<bool> Withdraw(decimal amount)
+        public async Task<bool> Withdraw(decimal amount, CancellationToken cancellationToken)
         {
             if (State.Balance < amount)
             {
@@ -149,9 +149,9 @@ namespace Orleans.EventSourcing.Kurrent.Tests.Grains
             return await base.RaiseConditionalEvent(new AccountEvent.Withdrawn(amount));
         }
 
-        public Task ClearLog() => base.ClearLogAsync(CancellationToken.None);
+        public Task ClearLog(CancellationToken cancellationToken) => base.ClearLogAsync(cancellationToken);
 
-        public async Task TruncateAccount()
+        public async Task TruncateAccount(CancellationToken cancellationToken)
         {
             RaiseEvent(new AccountEvent.Truncation(State.Balance));
             await ConfirmEvents();
