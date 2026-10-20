@@ -12,16 +12,20 @@ using Orleans.EventSourcing.Kurrent.Hosting;
 // Usage: dotnet run --project samples\LoadTest.Client -c Release -- <scenario> [options]
 //
 // Ramp options (events, reminders) — an open-loop ramp that starts at --start-rate ops/sec and
-// adds --step-rate every --step-seconds, reporting throughput, latency and failures per step:
+// adds --step-rate every --step-seconds, reporting throughput, latency and failures per step.
+// Each operation counts towards the step that issued it; a step is judged --settle-seconds after it ends.
 //   --start-rate <n>         initial target ops/sec
 //   --step-rate <n>          ops/sec added each step
 //   --step-seconds <n>       duration of each step
 //   --max-steps <n>          number of steps                          (default 20)
 //   --max-rate <n>           cap on the target rate
 //   --max-in-flight <n>      client-side concurrency cap; excess ops are shed (default 10000)
+//   --warmup-seconds <n>     unreported load at --start-rate before step 1 (default 10)
+//   --settle-seconds <n>     wait for a step's operations before judging it (default 5)
 //   --max-error-rate <f>     stop when a step's failure ratio exceeds this (default 0.01)
 //   --max-p99-ms <n>         stop when a step's p99 latency exceeds this (default off)
 //   --min-achieved <f>       stop when a step achieves less than this fraction of target (default 0.9)
+//   --max-client-lag-ms <n>  stop when the client issues ops this late (p99), i.e. the client is the limit (default 100)
 //   --csv <path>             write per-step results to a CSV file
 //
 // events — event write throughput through the log-consistency provider:
@@ -31,10 +35,13 @@ using Orleans.EventSourcing.Kurrent.Hosting;
 //   (ramp defaults: start 200/s, +200/s every 30s)
 //
 // reminders — Kurrent reminder table registration throughput, then tick delivery and lateness:
+//   --preload <n>            register n reminders up front, as fast as possible (default 0)
+//   --preload-concurrency <n> concurrent registrations during preload  (default 64)
 //   --period <seconds>       reminder period, minimum 60              (default 60)
 //   --observe <seconds>      how long to observe ticks after the ramp (default 3 x period)
+//   --kill-silo-after <s>    hard-kill a random silo this far into observation (needs >= 2 silos)
 //   --no-cleanup             leave the reminders registered afterwards
-//   (ramp defaults: start 20/s, +20/s every 30s, 10 steps, stop on any failure)
+//   (ramp defaults: start 20/s, +20/s every 30s, 10 steps, stop on any failure; --max-steps 0 skips it)
 //
 // mixed (default) — closed-loop deposits/withdrawals/reads/reminder churn on account grains:
 //   --grains <n>             number of event-sourced account grains   (default 10000)
