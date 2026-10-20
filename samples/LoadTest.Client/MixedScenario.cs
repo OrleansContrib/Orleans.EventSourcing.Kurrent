@@ -1,0 +1,269 @@
+using LoadTest.Grains;
+using System.Diagnostics;
+
+namespace LoadTest.Client;
+
+/// <summary>
+/// Closed-loop mixed workload (deposits, withdrawals, reads, reminder churn) against
+/// <see cref="IAccountGrain"/>s, validated against a client-side ledger at the end of the run.
+/// </summary>
+internal static class MixedScenario
+{
+    public static async Task<int> RunAsync(IClusterClient clusterClient, CommandLine args)
+    {
+        var options = LoadTestOptions.Parse(args);
+
+        Console.WriteLine($"Mixed scenario: grains={options.Grains} workers={options.Workers} duration={options.DurationSeconds}s reminder-fraction={options.ReminderFraction:P0}");
+
+        var grainIds = Enumerable.Range(0, options.Grains).Select(_ => Guid.NewGuid()).ToArray();
+        var expectedCents = new long[options.Grains];
+        var reminderGrainCount = (int)Math.Ceiling(options.Grains * options.ReminderFraction);
+        var reminderTicksBeforeLoad = new int[options.Grains];
+        var shouldValidateReminderTicks = reminderGrainCount > 0;
+
+        // --- Warm-up: activate every grain (first activation replays/creates its Kurrent stream).
+        var warmupWatch = Stopwatch.StartNew();
+        await Parallel.ForAsync(0, options.Grains, async (i, ct) =>
+        {
+            var grain = clusterClient.GetGrain<IAccountGrain>(grainIds[i]);
+            reminderTicksBeforeLoad[i] = (await grain.GetSummary()).InterestTicks;
+            if (i < reminderGrainCount)
+            {
+                // Orleans reminders have a 1 minute minimum period. The load test enforces a minimum
+                // duration of 90 seconds so reminder firing is part of every run.
+                await grain.EnableInterestReminder(TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+            }
+        });
+        warmupWatch.Stop();
+        Console.WriteLine($"Warm-up: activated {options.Grains} grains and registered {reminderGrainCount} reminders in {warmupWatch.Elapsed.TotalSeconds:F1}s");
+
+        // --- Load phase.
+        var stats = new WorkerStats[options.Workers];
+        var deadline = Stopwatch.StartNew();
+        var duration = TimeSpan.FromSeconds(options.DurationSeconds);
+
+        var workers = Enumerable.Range(0, options.Workers).Select(async workerIndex =>
+        {
+            var random = new Random(unchecked(Environment.TickCount * 397) ^ workerIndex);
+            var workerStats = stats[workerIndex] = new WorkerStats();
+            var opWatch = new Stopwatch();
+
+            while (deadline.Elapsed < duration)
+            {
+                var grainIndex = random.Next(options.Grains);
+                var grain = clusterClient.GetGrain<IAccountGrain>(grainIds[grainIndex]);
+                var roll = random.Next(100);
+
+                try
+                {
+                    opWatch.Restart();
+                    if (roll < 60)
+                    {
+                        // 60% deposits
+                        var amount = random.Next(1, 101);
+                        await grain.Deposit(amount);
+                        Interlocked.Add(ref expectedCents[grainIndex], amount * 100L);
+                        workerStats.Record(OpType.Deposit, opWatch.Elapsed);
+                    }
+                    else if (roll < 85)
+                    {
+                        // 25% withdrawals (grain rejects overdrafts)
+                        var amount = random.Next(1, 51);
+                        if (await grain.Withdraw(amount))
+                        {
+                            Interlocked.Add(ref expectedCents[grainIndex], -amount * 100L);
+                        }
+                        workerStats.Record(OpType.Withdraw, opWatch.Elapsed);
+                    }
+                    else if (roll < 98)
+                    {
+                        // 13% reads
+                        await grain.GetBalance();
+                        workerStats.Record(OpType.Read, opWatch.Elapsed);
+                    }
+                    else
+                    {
+                        // 2% reminder churn — register/unregister exercises the Kurrent reminder table under load.
+                        if (reminderGrainCount < options.Grains)
+                        {
+                            var churnGrain = clusterClient.GetGrain<IAccountGrain>(grainIds[random.Next(reminderGrainCount, options.Grains)]);
+                            await churnGrain.EnableInterestReminder(TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
+                            await churnGrain.DisableInterestReminder();
+                            workerStats.Record(OpType.ReminderChurn, opWatch.Elapsed);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    workerStats.RecordError(ex);
+                }
+            }
+        }).ToArray();
+
+        await Task.WhenAll(workers);
+        var elapsed = deadline.Elapsed;
+
+        // --- Report throughput and latency.
+        var merged = WorkerStats.Merge(stats);
+        var totalOps = merged.Values.Sum(latencies => latencies.Count);
+        var totalErrors = stats.Sum(s => s.Errors);
+
+        Console.WriteLine();
+        Console.WriteLine($"=== Load phase complete: {totalOps:N0} ops in {elapsed.TotalSeconds:F1}s = {totalOps / elapsed.TotalSeconds:N0} ops/sec ({totalErrors} errors) ===");
+        Console.WriteLine($"{"operation",-14} {"count",10} {"mean",9} {"p50",9} {"p95",9} {"p99",9} {"max",9}");
+        foreach (var (op, latencies) in merged.OrderBy(kv => kv.Key))
+        {
+            if (latencies.Count == 0)
+            {
+                continue;
+            }
+
+            latencies.Sort();
+            Console.WriteLine($"{op,-14} {latencies.Count,10:N0} {latencies.Average(),7:F1}ms {Percentile(latencies, 0.50),7:F1}ms {Percentile(latencies, 0.95),7:F1}ms {Percentile(latencies, 0.99),7:F1}ms {latencies[^1],7:F1}ms");
+        }
+
+        if (totalErrors > 0)
+        {
+            foreach (var error in stats.SelectMany(s => s.SampleErrors).Take(5))
+            {
+                Console.WriteLine($"  error: {error}");
+            }
+        }
+
+        // --- Optionally wait so the 1-minute reminders get a chance to tick.
+        if (options.ObserveRemindersSeconds > 0)
+        {
+            Console.WriteLine($"Waiting {options.ObserveRemindersSeconds}s for reminder ticks...");
+            await Task.Delay(TimeSpan.FromSeconds(options.ObserveRemindersSeconds));
+        }
+
+        // --- Validation: replayed, confirmed grain state must match the client-side ledger exactly.
+        Console.WriteLine();
+        Console.WriteLine("Validating confirmed state against client-side ledger...");
+        var mismatches = 0;
+        var reminderMismatches = 0;
+        var totalEvents = 0L;
+        var totalInterestTicks = 0;
+        var remindersActive = 0;
+
+        for (var i = 0; i < options.Grains; i++)
+        {
+            var summary = await clusterClient.GetGrain<IAccountGrain>(grainIds[i]).GetSummary();
+            totalEvents += summary.ConfirmedVersion;
+            totalInterestTicks += summary.InterestTicks;
+            if (summary.ReminderActive)
+            {
+                remindersActive++;
+            }
+
+            var expected = expectedCents[i] / 100m;
+            if (summary.Balance != expected)
+            {
+                mismatches++;
+                Console.WriteLine($"  MISMATCH grain {grainIds[i]}: expected {expected}, confirmed {summary.Balance}");
+            }
+
+            if (shouldValidateReminderTicks && i < reminderGrainCount && summary.InterestTicks <= reminderTicksBeforeLoad[i])
+            {
+                reminderMismatches++;
+                Console.WriteLine($"  REMINDER NOT OBSERVED grain {grainIds[i]}: expected interest ticks to increase from {reminderTicksBeforeLoad[i]}, observed {summary.InterestTicks}");
+            }
+        }
+
+        Console.WriteLine($"Confirmed events across all grains: {totalEvents:N0}");
+        Console.WriteLine($"Reminders active: {remindersActive} (expected >= {reminderGrainCount}), interest ticks observed: {totalInterestTicks}");
+        Console.WriteLine(mismatches == 0 && reminderMismatches == 0
+            ? $"VALIDATION PASSED: all {options.Grains} grain balances match the client-side ledger and reminder ticks were observed as expected."
+            : $"VALIDATION FAILED: {mismatches} balance mismatch(es), {reminderMismatches} reminder grain(s) did not observe a tick.");
+
+        return mismatches == 0 && reminderMismatches == 0 && totalErrors == 0 ? 0 : 1;
+    }
+
+    private static double Percentile(List<double> sorted, double percentile)
+        => sorted[Math.Min(sorted.Count - 1, (int)Math.Ceiling(percentile * sorted.Count) - 1)];
+
+    private enum OpType
+    {
+        Deposit,
+        Withdraw,
+        Read,
+        ReminderChurn,
+    }
+
+    private sealed class WorkerStats
+    {
+        private readonly Dictionary<OpType, List<double>> _latencies = new();
+        private readonly List<string> _sampleErrors = [];
+
+        public int Errors { get; private set; }
+
+        public IReadOnlyList<string> SampleErrors => _sampleErrors;
+
+        public void Record(OpType op, TimeSpan latency)
+        {
+            if (!_latencies.TryGetValue(op, out var list))
+            {
+                _latencies[op] = list = [];
+            }
+
+            list.Add(latency.TotalMilliseconds);
+        }
+
+        public void RecordError(Exception ex)
+        {
+            Errors++;
+            if (_sampleErrors.Count < 5)
+            {
+                _sampleErrors.Add($"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        public static Dictionary<OpType, List<double>> Merge(IEnumerable<WorkerStats> all)
+        {
+            var merged = new Dictionary<OpType, List<double>>();
+            foreach (var stats in all)
+            {
+                foreach (var (op, latencies) in stats._latencies)
+                {
+                    if (!merged.TryGetValue(op, out var list))
+                    {
+                        merged[op] = list = [];
+                    }
+
+                    list.AddRange(latencies);
+                }
+            }
+
+            return merged;
+        }
+    }
+
+    private sealed record LoadTestOptions
+    {
+        public int Grains { get; init; } = 10000;
+        public int Workers { get; init; } = 32;
+        public int DurationSeconds { get; init; } = 90;
+        public double ReminderFraction { get; init; } = 0.1;
+        public int ObserveRemindersSeconds { get; init; }
+
+        public static LoadTestOptions Parse(CommandLine args)
+        {
+            var defaults = new LoadTestOptions();
+            var options = new LoadTestOptions
+            {
+                Grains = args.GetInt("grains", defaults.Grains),
+                Workers = args.GetInt("workers", defaults.Workers),
+                DurationSeconds = args.GetInt("duration", defaults.DurationSeconds),
+                ReminderFraction = args.GetDouble("reminder-fraction", defaults.ReminderFraction),
+                ObserveRemindersSeconds = args.GetInt("observe-reminders", defaults.ObserveRemindersSeconds),
+            };
+
+            if (options.DurationSeconds < 90)
+            {
+                throw new ArgumentOutOfRangeException(nameof(options.DurationSeconds), options.DurationSeconds, "The load test duration must be at least 90 seconds so 1-minute reminders are exercised.");
+            }
+
+            return options;
+        }
+    }
+}
