@@ -43,6 +43,27 @@ using Orleans.EventSourcing.Kurrent.Hosting;
 //   --no-cleanup             leave the reminders registered afterwards
 //   (ramp defaults: start 20/s, +20/s every 30s, 10 steps, stop on any failure; --max-steps 0 skips it)
 //
+// rolling — rolling update of the silos, then the KurrentDB nodes, under steady load. The client starts
+// its own silos and drives the KurrentDB containers through Docker; KURRENT_CONNECTION_STRING must list
+// every node, e.g. esdb://localhost:2113,localhost:2213,localhost:2313?tls=false
+//   --silos <n>              silos to run                             (default 3)
+//   --plan <p>               both | silos | kurrent | none            (default both)
+//   --silo-stop <m>          graceful | kill                          (default graceful)
+//   --surge                  start each replacement silo before stopping the old one
+//   --kurrent-nodes <list>   container names                          (default kurrentdb1,kurrentdb2,kurrentdb3)
+//   --kurrent-stop <m>       graceful (docker stop) | kill            (default graceful)
+//   --kurrent-order <o>      followers-first | leader-first | listed  (default followers-first)
+//   --node-down <seconds>    how long each Kurrent node stays down    (default 30)
+//   --settle <seconds>       steady load before, between and after steps (default 30)
+//   --rate <n>               event appends per second                 (default 200)
+//   --grains/--batch/--payload as for events (default 500 grains)
+//   --reminders <n>          reminders kept ticking throughout        (default 200)
+//   --max-failed <n>         fail the run if more appends than this fail (default off)
+//   --report-interval <s>    timeline row interval                    (default 5)
+//   --external-silos         use already-running silos (only --plan kurrent)
+//   --silo-path <dll>        LoadTest.Silo.dll to run                 (default: the sibling build)
+//   --log-dir <dir>          where silo logs go                       (default loadtest-logs/<timestamp>)
+//
 // mixed (default) — closed-loop deposits/withdrawals/reads/reminder churn on account grains:
 //   --grains <n>             number of event-sourced account grains   (default 10000)
 //   --workers <n>            number of concurrent client workers      (default 32)
@@ -60,17 +81,8 @@ var options = new CommandLine(args);
 var connectionString = Environment.GetEnvironmentVariable("KURRENT_CONNECTION_STRING")
                        ?? "esdb://localhost:2113?tls=false";
 
-var builder = Host.CreateApplicationBuilder();
-builder.Logging.AddFilter("Orleans", LogLevel.Warning);
-builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
-builder.UseOrleansClient(client => client.UseKurrentClustering(x => x.ClientSettings = KurrentDBClientSettings.Create(connectionString)));
 
-using var host = builder.Build();
-await host.StartAsync();
-var clusterClient = host.Services.GetRequiredService<IClusterClient>();
-Console.WriteLine("Connected.");
-
-// Ctrl+C stops the ramp early but still runs verification and cleanup.
+// Ctrl+C stops the load early but still runs verification and cleanup.
 using var cancellation = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
@@ -82,12 +94,41 @@ Console.CancelKeyPress += (_, e) =>
     }
 };
 
+// The rolling scenario runs its own silos (unless --external-silos), so they must be up before the client connects.
+var siloCount = options.GetInt("silos", 3);
+await using var managedSilos = scenario == "rolling" && !options.Has("external-silos")
+    ? new SiloProcessManager(
+        options.GetString("silo-path") ?? SiloProcessManager.DefaultSiloPath(),
+        connectionString,
+        Path.GetFullPath(options.GetString("log-dir") ?? Path.Combine("loadtest-logs", DateTime.Now.ToString("yyyyMMdd-HHmmss"))))
+    : null;
+if (managedSilos is not null)
+{
+    Console.WriteLine($"Starting {siloCount} silos...");
+    for (var i = 0; i < siloCount; i++)
+    {
+        var silo = await managedSilos.StartAsync(cancellation.Token);
+        Console.WriteLine($"  {silo} running");
+    }
+}
+
+var builder = Host.CreateApplicationBuilder();
+builder.Logging.AddFilter("Orleans", LogLevel.Warning);
+builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
+builder.UseOrleansClient(client => client.UseKurrentClustering(x => x.ClientSettings = KurrentDBClientSettings.Create(connectionString)));
+
+using var host = builder.Build();
+await host.StartAsync();
+var clusterClient = host.Services.GetRequiredService<IClusterClient>();
+Console.WriteLine("Connected.");
+
 var exitCode = scenario switch
 {
     "events" => await EventsScenario.RunAsync(clusterClient, options, cancellation.Token),
     "reminders" => await RemindersScenario.RunAsync(clusterClient, options, cancellation.Token),
+    "rolling" => await RollingScenario.RunAsync(clusterClient, options, managedSilos, siloCount, connectionString, cancellation.Token),
     "mixed" => await MixedScenario.RunAsync(clusterClient, options),
-    _ => throw new ArgumentException($"Unknown scenario '{scenario}'. Expected events, reminders or mixed."),
+    _ => throw new ArgumentException($"Unknown scenario '{scenario}'. Expected events, reminders, rolling or mixed."),
 };
 
 await host.StopAsync();
