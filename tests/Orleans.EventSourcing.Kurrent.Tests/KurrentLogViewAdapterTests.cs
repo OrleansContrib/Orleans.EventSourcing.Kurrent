@@ -1,5 +1,6 @@
 using System.Diagnostics.Metrics;
 using System.Globalization;
+using System.Net.Http;
 using System.Text;
 
 using Grpc.Core;
@@ -469,6 +470,8 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             { new NotLeaderException("localhost", 2313), true },
             { new DiscoveryException(10), true },
             { new RpcException(new Status(StatusCode.Unavailable, "unavailable")), true },
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0, "The HTTP/2 server closed the connection.", null))), true },
+            { new RpcException(new Status(StatusCode.Internal, "internal")), false },
             { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
             { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },
             { new WrongExpectedVersionException("stream", StreamState.NoStream, StreamState.StreamRevision(1)), false },

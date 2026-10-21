@@ -270,7 +270,7 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 
 ### Riding out a leader change
 
-When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. The log-consistency provider (and so the reminders provider, which is built on it) retries those requests, so a leader change shows up as extra latency rather than failed grain calls. It retries `NotLeaderException`, `DiscoveryException` and gRPC `Unavailable` failures of appends, stream loads, `RetrieveLogSegment`, truncation metadata updates and tombstones, with exponential backoff and jitter. Other failures, and cancellation, are not retried.
+When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. The log-consistency provider (and so the reminders provider, which is built on it) retries those requests, so a leader change shows up as extra latency rather than failed grain calls. It retries `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures and calls cut off by the old leader closing its connection, for appends, stream loads, `RetrieveLogSegment`, truncation metadata updates and tombstones, with exponential backoff and jitter. Other failures, and cancellation, are not retried.
 
 | `Retry` property | Default | Description |
 | --- | --- | --- |

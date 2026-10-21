@@ -15,13 +15,16 @@ namespace Orleans.EventSourcing.Kurrent.Storage;
 internal static class KurrentRetry
 {
     /// <summary>
-    ///     True for failures that clear once the client has found the new leader. None of them means the
-    ///     server applied the request: <see cref="NotLeaderException"/> and <see cref="DiscoveryException"/> are
-    ///     raised before it is accepted, and an <see cref="StatusCode.Unavailable"/> append is only retried with
-    ///     the same event IDs and expected version, which Kurrent treats as idempotent.
+    ///     True for failures that clear once the client has found the new leader. <see cref="NotLeaderException"/>
+    ///     and <see cref="DiscoveryException"/> are raised before the request is accepted. An
+    ///     <see cref="StatusCode.Unavailable"/> failure, or the old leader closing its HTTP/2 connection mid-call
+    ///     as it shuts down, leaves the outcome unknown; that is safe because an append is only retried with the
+    ///     same event IDs and expected version, which Kurrent treats as idempotent.
     /// </summary>
     public static bool IsTransient(Exception exception)
-        => exception is NotLeaderException or DiscoveryException or RpcException { StatusCode: StatusCode.Unavailable };
+        => exception is NotLeaderException or DiscoveryException
+            or RpcException { StatusCode: StatusCode.Unavailable }
+            or RpcException { StatusCode: StatusCode.Internal, Status.DebugException: HttpProtocolException };
 
     /// <summary>
     ///     Runs <paramref name="operation"/>, retrying transient failures with exponential backoff until
