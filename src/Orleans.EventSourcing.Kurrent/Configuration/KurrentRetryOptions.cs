@@ -8,7 +8,7 @@ public sealed class KurrentRetryOptions
     /// <summary>
     ///     The maximum number of attempts for an operation, including the first one. Set to 1 to disable retries.
     /// </summary>
-    public int MaxAttempts { get; set; } = 10;
+    public int MaxAttempts { get; set; } = 13;
 
     /// <summary>
     ///     The delay before the first retry. The delay doubles on each subsequent attempt, with jitter applied.

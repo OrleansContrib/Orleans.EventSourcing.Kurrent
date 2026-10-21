@@ -274,11 +274,11 @@ When a KurrentDB cluster changes leader, the client's next request to the old le
 
 | `Retry` property | Default | Description |
 | --- | --- | --- |
-| `MaxAttempts` | `10` | Maximum attempts, including the first. `1` disables retries. |
+| `MaxAttempts` | `13` | Maximum attempts, including the first. `1` disables retries. |
 | `BaseDelay` | `100ms` | Delay before the first retry; doubles on each attempt after that. |
 | `MaxDelay` | `2s` | Upper bound on the delay between attempts. |
 
-The defaults keep retrying for roughly 5 to 11 seconds, which covers a typical election. Keep the total under the Orleans response timeout (30 seconds by default).
+The defaults keep retrying for roughly 10 to 19 seconds; in testing a 3-node cluster took about 7 seconds to elect a new leader after the old one was stopped. Keep the total under the Orleans response timeout (30 seconds by default).
 
 Retried appends are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
 
