@@ -1,11 +1,15 @@
 using System.Diagnostics.Metrics;
 using System.Globalization;
+using System.Net.Http;
 using System.Text;
+
+using Grpc.Core;
 
 using KurrentDB.Client;
 
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Observability;
 using Orleans.EventSourcing.Kurrent.Storage;
 using Orleans.Storage;
@@ -267,16 +271,237 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             }
         }
 
+        [Fact]
+        public async Task NotLeaderOnAppendIsRetried()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 3);
+
+                Assert.True(await adapter.TryAppend(new Applied(5)));
+                Assert.Equal(105, adapter.ConfirmedView.Balance);
+                Assert.Equal(2, adapter.ConfirmedVersion);
+
+                // Written exactly once
+                Assert.Equal(2, (await adapter.RetrieveLogSegment(0, 10)).Count);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task NotLeaderDoesNotFailWritesQueuedBehindIt()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 2);
+
+                // Several writes queued while the leader changes, as a reentrant grain would
+                adapter.Submit(new Applied(10));
+                adapter.SubmitRange([new Applied(20), new Applied(30)]);
+                adapter.Submit(new Applied(40));
+
+                await adapter.ConfirmSubmittedEntries();
+
+                Assert.Equal(101, adapter.ConfirmedView.Balance);
+                Assert.Equal(5, adapter.ConfirmedVersion);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task UnavailableAfterAppendLandedIsRetriedIdempotently()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                // The write lands but the reply is lost; the retry resends the same event IDs
+                client.AddExceptionToThrowAfterAppendOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+
+                Assert.True(await adapter.TryAppend(new Applied(5)));
+                Assert.Equal(2, adapter.ConfirmedVersion);
+                Assert.Equal(2, (await adapter.RetrieveLogSegment(0, 10)).Count);
+
+                await adapter.Synchronize();
+                Assert.Equal(105, adapter.ConfirmedView.Balance);
+                Assert.Equal(2, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task NotLeaderOnLoadIsRetried()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppendRange([new Applied(100), new Applied(7)]));
+
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 2);
+
+                await adapter.Synchronize();
+
+                Assert.Equal(107, adapter.ConfirmedView.Balance);
+                Assert.Equal(107, adapter.TentativeView.Balance);
+                Assert.Equal(2, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task NotLeaderOnRetrieveLogSegmentIsRetried()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppendRange([new Applied(1), new Applied(2), new Applied(3)]));
+                var expected = await adapter.RetrieveLogSegment(1, 2);
+
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 2);
+
+                var segment = await adapter.RetrieveLogSegment(1, 2);
+                Assert.Equal(2, segment.Count);
+                Assert.Equal(expected, segment);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task NotLeaderBeyondRetryBudgetSurfacesUntilResynchronized()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), FastRetry.MaxAttempts);
+
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
+                Assert.IsType<NotLeaderException>(ex.InnerException);
+
+                await adapter.Synchronize();
+                Assert.Equal(1, adapter.ConfirmedView.Balance);
+                Assert.True(await adapter.TryAppend(new Applied(10)));
+                Assert.Equal(11, adapter.ConfirmedView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task NonTransientFailuresAreNotRetried()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                // A retry would succeed, so the failure only surfaces if the append is not retried
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
+
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
+                Assert.IsType<RpcException>(ex.InnerException);
+
+                await adapter.Synchronize();
+                Assert.Equal(1, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task DisposeStopsRetryingPromptly()
+        {
+            var slowRetry = new KurrentRetryOptions { MaxAttempts = 100, BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(slowRetry);
+
+            Assert.True(await adapter.TryAppend(new Applied(1)));
+
+            client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 100);
+            adapter.Submit(new Applied(10));
+
+            // Lets the append start and back off before the adapter is disposed
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+            await adapter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        }
+
+        [Theory]
+        [MemberData(nameof(TransientExceptions))]
+        public void TransientClassification(Exception exception, bool transient)
+            => Assert.Equal(transient, KurrentRetry.IsTransient(exception));
+
+        public static TheoryData<Exception, bool> TransientExceptions => new()
+        {
+            { new NotLeaderException("localhost", 2313), true },
+            { new DiscoveryException(10), true },
+            { new RpcException(new Status(StatusCode.Unavailable, "unavailable")), true },
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0, "The HTTP/2 server closed the connection.", null))), true },
+            { new RpcException(new Status(StatusCode.Internal, "internal")), false },
+            { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
+            { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },
+            { new WrongExpectedVersionException("stream", StreamState.NoStream, StreamState.StreamRevision(1)), false },
+            { new OperationCanceledException(), false },
+            { new TimeoutException(), false },
+        };
+
+        private static readonly KurrentRetryOptions FastRetry = new() { MaxAttempts = 5, BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(5) };
+
+        private static (KurrentLogViewAdapter<TestView, TestLogEntry> Adapter, ExceptionalKurrentClientWrapper Client, string StreamName) CreateLeaderChangeAdapter(KurrentRetryOptions? retry = null)
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var client = new ExceptionalKurrentClientWrapper(new InMemoryKurrentClient());
+            var adapter = CreateAdapter(client, services, streamNameProvider, retry: retry ?? FastRetry);
+            return (adapter, client, streamNameProvider.GetStreamName(services.GrainId));
+        }
+
         private static KurrentLogViewAdapter<TestView, TestLogEntry> CreateAdapter(IKurrentClient client,
                                                                                     TestLogConsistencyProtocolServices services,
                                                                                     IKurrentStreamNameProvider streamNameProvider,
-                                                                                    TestEventSerializer? serializer = null)
+                                                                                    TestEventSerializer? serializer = null,
+                                                                                    KurrentRetryOptions? retry = null)
             => new(new TestLogViewAdaptorHost(),
                    client,
                    serializer ?? new TestEventSerializer(),
                    services,
                    streamNameProvider,
-                   Metrics);
+                   Metrics,
+                   retry ?? new KurrentRetryOptions());
 
         // The same default IMeterFactory that Orleans registers for silos and clients
         private static readonly KurrentMetrics Metrics = new(new ServiceCollection().AddMetrics().BuildServiceProvider().GetRequiredService<IMeterFactory>());
