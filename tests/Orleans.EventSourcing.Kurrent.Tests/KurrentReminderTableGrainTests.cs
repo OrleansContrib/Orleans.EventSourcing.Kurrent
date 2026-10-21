@@ -16,6 +16,7 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
 
     private InProcessTestCluster cluster = null!;
     private IReminderTable table = null!;
+    private ExceptionalKurrentClientWrapper kurrentClient = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -23,6 +24,7 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
         // so that TryAddKeyedSingleton inside AddKurrentReminderService does not replace it.
         // This keeps this class's Kurrent state isolated from other test classes.
         var inMemoryClient = new InMemoryKurrentClient();
+        kurrentClient = new ExceptionalKurrentClientWrapper(inMemoryClient); // Lets us simulate a leader change
 
         var builder = new InProcessTestClusterBuilder();
         builder.ConfigureClient(c => c.AddActivityPropagation());
@@ -30,7 +32,7 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
         {
             c.Services.AddKeyedSingleton<IKurrentClient>(
                 KurrentReminderServiceCollectionExtensions.LOG_PROVIDER_NAME,
-                inMemoryClient);
+                kurrentClient);
             c.AddKurrentReminderService(o => o.ClientSettings = clientSettings);
         });
         builder.Options.ConfigureFileLogging = false;
@@ -276,6 +278,53 @@ public sealed class KurrentReminderTableGrainTests : IAsyncLifetime
     }
 
     // Persistence tests
+
+    [Fact(Timeout = Timeout)]
+    public async Task ConcurrentWrites_SurviveLeaderChange()
+    {
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
+        var grainId = NewGrainId();
+        Assert.NotNull(await table.UpsertRow(MakeEntry(grainId, "before"), TestContext.Current.CancellationToken));
+
+        var tableGrain = cluster.Client.GetGrain<IReminderTableGrain>(default(IdSpan));
+        var streamName = new KurrentStreamName().GetStreamName(tableGrain.GetGrainId());
+
+        // The first writes after the leader changes are rejected by the old leader
+        kurrentClient.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 3);
+
+        // The reminder table grain is reentrant, so these queue behind the write that hits NotLeader
+        var upserts = Enumerable.Range(0, 20)
+                                .Select(i => table.UpsertRow(MakeEntry(grainId, $"r{i}"), TestContext.Current.CancellationToken))
+                                .ToArray();
+        var etags = await Task.WhenAll(upserts);
+        Assert.All(etags, Assert.NotNull);
+
+        Assert.Equal(21, (await table.ReadRows(grainId, TestContext.Current.CancellationToken)).Reminders.Count);
+
+        // Every write was persisted, exactly once
+        await tableGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
+        var reloaded = await table.ReadRows(grainId, TestContext.Current.CancellationToken);
+        Assert.Equal(21, reloaded.Reminders.Count);
+        Assert.Equal(etags.Order(StringComparer.Ordinal), reloaded.Reminders.Where(r => r.ReminderName != "before").Select(r => r.ETag).Order(StringComparer.Ordinal));
+    }
+
+    [Fact(Timeout = Timeout)]
+    public async Task Activation_SurvivesLeaderChange()
+    {
+        await table.TestOnlyClearTable(TestContext.Current.CancellationToken);
+        var grainId = NewGrainId();
+        var etag = await table.UpsertRow(MakeEntry(grainId, "r1"), TestContext.Current.CancellationToken);
+
+        var tableGrain = cluster.Client.GetGrain<IReminderTableGrain>(default(IdSpan));
+        await tableGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
+
+        // The reload on reactivation hits the old leader first
+        kurrentClient.AddExceptionToThrowForTesting(new KurrentStreamName().GetStreamName(tableGrain.GetGrainId()), new NotLeaderException("localhost", 2313), 2);
+
+        var result = await table.ReadRow(grainId, "r1", TestContext.Current.CancellationToken);
+        Assert.NotNull(result);
+        Assert.Equal(etag, result.ETag);
+    }
 
     [Fact(Timeout = Timeout)]
     public async Task StateIsPreserved_AfterGrainDeactivation()

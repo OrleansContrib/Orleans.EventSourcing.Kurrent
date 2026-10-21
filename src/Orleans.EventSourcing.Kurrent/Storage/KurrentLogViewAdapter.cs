@@ -1,4 +1,5 @@
 using KurrentDB.Client;
+using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Observability;
 
 using Orleans.Storage;
@@ -21,7 +22,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     bool writeRejected;
     bool disposed;
 
-    public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics)
+    public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics, KurrentRetryOptions retry)
     {
         this.host = host;
         this.context = new CommandContext
@@ -30,6 +31,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
             StreamName = streamNameProvider.GetStreamName(services.GrainId),
             Converter = eventConverter,
             Metrics = metrics,
+            Retry = retry,
             Host = host,
             Tags = new TagList
             {
@@ -115,16 +117,20 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         try
         {
-            var readResult = await context.Client.ReadStreamAsync(Direction.Forwards, context.StreamName, fromVersion.ToStreamPosition(), maxCount, false, CancellationToken.None)
-                                                 .ConfigureAwait(false);
-
-            var result = new List<TLogEntry>();
-            await foreach (var resolvedEvent in readResult.ConfigureAwait(false))
+            // Retry the whole read, not just opening it: a leader change can fail the enumeration too.
+            return await KurrentRetry.ExecuteAsync<IReadOnlyList<TLogEntry>>(context.Retry, context.Metrics, "RetrieveLogSegment", async token =>
             {
-                result.Add(Deserialize(context, resolvedEvent));
-            }
+                var readResult = await context.Client.ReadStreamAsync(Direction.Forwards, context.StreamName, fromVersion.ToStreamPosition(), maxCount, false, token)
+                                                     .ConfigureAwait(false);
 
-            return result;
+                var result = new List<TLogEntry>();
+                await foreach (var resolvedEvent in readResult.WithCancellation(token).ConfigureAwait(false))
+                {
+                    result.Add(Deserialize(context, resolvedEvent));
+                }
+
+                return result;
+            }, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -355,7 +361,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         if (expectedVersion > 0)
         {
-            _ = await context.Client.TombstoneStreamAsync(context.StreamName, expectedVersion.ToStreamState(), linked.Token).ConfigureAwait(true);
+            _ = await KurrentRetry.ExecuteAsync(context.Retry, context.Metrics, "Tombstone", token => context.Client.TombstoneStreamAsync(context.StreamName, expectedVersion.ToStreamState(), token), linked.Token).ConfigureAwait(true);
         }
 
         // The stream is gone; there is nothing left to be inconsistent with.
@@ -464,7 +470,14 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     private static bool IsDeletePriorEventsMarker(TLogEntry entry)
         => entry?.GetType().IsDefined(typeof(DiscardPriorEventsAttribute), inherit: true) == true;
 
-    private static async Task DeleteBeforeAsync(CommandContext context, StreamPosition truncateBefore, CancellationToken cancellationToken)
+    /// <summary>
+    /// Sets $tb to <paramref name="truncateBefore"/>. The read and the conditional write are retried
+    /// together, so a retry after a write that did land sees $tb already set and does nothing.
+    /// </summary>
+    private static Task DeleteBeforeAsync(CommandContext context, StreamPosition truncateBefore, CancellationToken cancellationToken)
+        => KurrentRetry.ExecuteAsync(context.Retry, context.Metrics, "SetTruncateBefore", token => SetTruncateBeforeAsync(context, truncateBefore, token), cancellationToken);
+
+    private static async Task SetTruncateBeforeAsync(CommandContext context, StreamPosition truncateBefore, CancellationToken cancellationToken)
     {
         var streamMetadataResult = await context.Client.GetStreamMetadata(context.StreamName, cancellationToken).ConfigureAwait(false);
 
@@ -532,6 +545,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         public required string StreamName { get; init; }
         public required IEventConverter<TLogEntry> Converter { get; init; }
         public required KurrentMetrics Metrics { get; init; }
+        public required KurrentRetryOptions Retry { get; init; }
         public required ILogViewAdaptorHost<TLogView, TLogEntry> Host { get; init; }
         public required TagList Tags { get; init; }
     }
@@ -545,6 +559,19 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     /// </summary>
     private static async Task<LoadResult> LoadAsync(CommandContext context, CancellationToken token)
     {
+        // Retry the whole replay, not just opening the read: a leader change can fail the enumeration too.
+        var (result, pendingTruncationPosition) = await KurrentRetry.ExecuteAsync(context.Retry, context.Metrics, "Load", t => ReplayAsync(context, t), token).ConfigureAwait(false);
+
+        if (pendingTruncationPosition is { } truncPos)
+        {
+            await DeleteBeforeAsync(context, truncPos, token).ConfigureAwait(false);
+        }
+
+        return result;
+    }
+
+    private static async Task<(LoadResult Result, StreamPosition? PendingTruncationPosition)> ReplayAsync(CommandContext context, CancellationToken token)
+    {
         var confirmedView = new TLogView();
         var tentativeView = new TLogView();
         var version = 0;
@@ -554,7 +581,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         var readResult = await context.Client.ReadStreamAsync(Direction.Forwards, context.StreamName, StreamPosition.Start, int.MaxValue, false, token)
                                              .ConfigureAwait(false);
 
-        await foreach (var resolvedEvent in readResult.ConfigureAwait(false))
+        await foreach (var resolvedEvent in readResult.WithCancellation(token).ConfigureAwait(false))
         {
             var deserializedLog = Deserialize(context, resolvedEvent);
             if (IsDeletePriorEventsMarker(deserializedLog) && !firstEventInStream)
@@ -576,21 +603,20 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
             version = readResult.LastStreamPosition.Value.ToVersion();
         }
 
-        if (pendingTruncationPosition is { } truncPos)
-        {
-            await DeleteBeforeAsync(context, truncPos, token).ConfigureAwait(false);
-        }
-
-        return new LoadResult(confirmedView, tentativeView, version);
+        return (new LoadResult(confirmedView, tentativeView, version), pendingTruncationPosition);
     }
 
     /// <summary>
     /// Conditionally appends a snapshot of submitted entries. Returns false on a version
     /// mismatch; the grain decides how to react when it observes the result.
+    /// The batch is serialized once, so every attempt carries the same event IDs and expected
+    /// version: a retry after an append that did land is acknowledged by Kurrent as idempotent
+    /// rather than written twice.
     /// </summary>
     private static async Task<bool> AppendAsync(CommandContext context, TLogEntry[] batch, int expectedVersion, CancellationToken token)
     {
-        var writeResult = await context.Client.ConditionalAppendToStreamAsync(context.StreamName, expectedVersion.ToStreamState(), Serialize(context, batch), token).ConfigureAwait(false);
+        var events = Serialize(context, batch);
+        var writeResult = await KurrentRetry.ExecuteAsync(context.Retry, context.Metrics, "Append", t => context.Client.ConditionalAppendToStreamAsync(context.StreamName, expectedVersion.ToStreamState(), events, t), token).ConfigureAwait(false);
 
         var success = writeResult.Status switch
         {

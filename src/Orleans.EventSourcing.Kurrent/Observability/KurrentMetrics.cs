@@ -28,6 +28,8 @@ internal sealed class KurrentMetrics
 
         StateDeserializationLatency = Meter.CreateHistogram<long>("State.Deserialization", "ms", "Time taken to deserialize");
         StateSerializationLatency = Meter.CreateHistogram<long>("State.Serialization", "ms", "Time taken to serialize");
+
+        Retries = Meter.CreateCounter<int>("Retries", "count", "Number of Kurrent operations retried after a leader change");
     }
 
     /// <summary>
@@ -48,4 +50,6 @@ internal sealed class KurrentMetrics
 
     public Histogram<long> StateDeserializationLatency { get; }
     public Histogram<long> StateSerializationLatency { get; }
+
+    public Counter<int> Retries { get; }
 }
