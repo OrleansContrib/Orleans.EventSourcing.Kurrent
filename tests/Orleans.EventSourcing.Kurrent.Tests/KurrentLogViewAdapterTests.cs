@@ -334,7 +334,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 Assert.True(await adapter.TryAppend(new Applied(100)));
 
                 // The write lands but the reply is lost; the retry resends the same event IDs
-                client.AddExceptionToThrowAfterAppendOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+                client.AddExceptionToThrowAfterWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
 
                 Assert.True(await adapter.TryAppend(new Applied(5)));
                 Assert.Equal(2, adapter.ConfirmedVersion);
@@ -343,6 +343,51 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 await adapter.Synchronize();
                 Assert.Equal(105, adapter.ConfirmedView.Balance);
                 Assert.Equal(2, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ClearLogSucceedsWhenTheTombstoneLandedButItsReplyWasLost()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppendRange([new Applied(100), new Applied(5)]));
+
+                // The tombstone lands but the reply is lost; the retry then finds the stream already deleted
+                client.AddExceptionToThrowAfterWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+
+                await adapter.ClearLogAsync(TestContext.Current.CancellationToken);
+
+                Assert.Equal(0, adapter.ConfirmedVersion);
+                Assert.Equal(0, adapter.ConfirmedView.Balance);
+                await Assert.ThrowsAsync<StreamDeletedException>(() => client.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken));
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ClearLogStillFailsWhenTheStreamWasAlreadyDeleted()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                // Deleted by someone else before this adapter's first attempt, so it is not a lost reply
+                await client.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken);
+
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(TestContext.Current.CancellationToken));
+                Assert.IsType<StreamDeletedException>(ex.InnerException);
             }
             finally
             {

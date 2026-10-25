@@ -390,6 +390,12 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
         await singleAccess.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            // Real KurrentDB: tombstoning an already tombstoned stream fails, even at the same expected revision
+            if (tombstoned.Contains(streamName))
+            {
+                throw new StreamDeletedException(streamName);
+            }
+
             if (!streams.TryGetValue(streamName, out var events))
             {
                 return new DeleteResult();

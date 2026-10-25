@@ -43,28 +43,34 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
         }
     }
 
-    // Applies the next append to the stream and then throws, simulating a reply lost after the write landed
-    internal void AddExceptionToThrowAfterAppendOnceForTesting(string streamName, Exception exception) => afterAppendExceptionToThrowOnce[streamName] = exception;
+    // Applies the next append, delete or tombstone of the stream and then throws, simulating a reply lost after the write landed
+    internal void AddExceptionToThrowAfterWriteOnceForTesting(string streamName, Exception exception) => afterWriteExceptionToThrowOnce[streamName] = exception;
 
-    readonly ConcurrentDictionary<string, Exception> afterAppendExceptionToThrowOnce = new();
+    readonly ConcurrentDictionary<string, Exception> afterWriteExceptionToThrowOnce = new();
+
+    private void ThrowIfExceptionAfterWrite(string streamName)
+    {
+        if (afterWriteExceptionToThrowOnce.Remove(streamName, out var ex))
+        {
+            throw ex;
+        }
+    }
 
     #region IKurrentClient
     public async Task<ConditionalWriteResult> ConditionalAppendToStreamAsync(string streamName, StreamState expectedRevision, IEnumerable<EventData> eventData, CancellationToken cancellationToken)
     {
         ThrowIfException(streamName);
         var result = await passthrough.ConditionalAppendToStreamAsync(streamName, expectedRevision, eventData, cancellationToken).ConfigureAwait(false);
-        if (afterAppendExceptionToThrowOnce.Remove(streamName, out var ex))
-        {
-            throw ex;
-        }
-
+        ThrowIfExceptionAfterWrite(streamName);
         return result;
     }
 
-    public Task<DeleteResult> DeleteStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
+    public async Task<DeleteResult> DeleteStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
     {
         ThrowIfException(streamName);
-        return passthrough.DeleteStreamAsync(streamName, expectedRevision, token);
+        var result = await passthrough.DeleteStreamAsync(streamName, expectedRevision, token).ConfigureAwait(false);
+        ThrowIfExceptionAfterWrite(streamName);
+        return result;
     }
 
     public void Dispose() => passthrough.Dispose();
@@ -96,10 +102,12 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
     public IAsyncEnumerable<StreamMessage> CatchUpSubscription(FromAll start, IEventFilter eventFilter, uint checkpointInterval, CancellationToken cancellationToken)
         => passthrough.CatchUpSubscription(start, eventFilter, checkpointInterval, cancellationToken);
 
-    public Task<DeleteResult> TombstoneStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
+    public async Task<DeleteResult> TombstoneStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
     {
         ThrowIfException(streamName);
-        return passthrough.TombstoneStreamAsync(streamName, expectedRevision, token);
+        var result = await passthrough.TombstoneStreamAsync(streamName, expectedRevision, token).ConfigureAwait(false);
+        ThrowIfExceptionAfterWrite(streamName);
+        return result;
     }
 
     #endregion

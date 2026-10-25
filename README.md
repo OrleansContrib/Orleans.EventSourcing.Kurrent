@@ -266,11 +266,14 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 | `ClientSettings` | `KurrentDBClientSettings` used to build the underlying `KurrentClient`. |
 | `GrainStorageSerializer` | Orleans' `IGrainStorageSerializer` used by the default event serializer. |
 | `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `KurrentStreamName.Default`. |
-| `Retry` | `KurrentRetryOptions` controlling how the log-consistency provider retries across a KurrentDB leader change. See below. |
+| `Retry` | `KurrentRetryOptions` controlling how the storage providers retry across a KurrentDB leader change. See below. |
 
 ### Riding out a leader change
 
-When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. The log-consistency provider (and so the reminders provider, which is built on it) retries those requests, so a leader change shows up as extra latency rather than failed grain calls. It retries `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures and calls cut off by the old leader closing its connection, for appends, stream loads, `RetrieveLogSegment`, truncation metadata updates and tombstones, with exponential backoff and jitter. Other failures, and cancellation, are not retried.
+When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. Both storage providers (and so the reminders provider, which is built on the log-consistency provider) retry those requests, so a leader change shows up as extra latency rather than failed grain calls. They retry `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures and calls cut off by the old leader closing its connection, with exponential backoff and jitter. Other failures, and cancellation, are not retried.
+
+- Log-consistency provider: appends, stream loads, `RetrieveLogSegment`, truncation metadata updates and tombstones.
+- Grain storage provider: state reads, writes and clears, and the `$maxCount` metadata update.
 
 | `Retry` property | Default | Description |
 | --- | --- | --- |
@@ -280,7 +283,7 @@ When a KurrentDB cluster changes leader, the client's next request to the old le
 
 The defaults keep retrying for roughly 10 to 19 seconds; in testing a 3-node cluster took about 7 seconds to elect a new leader after the old one was stopped. Keep the total under the Orleans response timeout (30 seconds by default).
 
-Retried appends are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
+Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again, and a tombstone that already landed is treated as done. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
 
 ### Custom event stream naming
 

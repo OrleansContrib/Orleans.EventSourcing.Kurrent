@@ -59,7 +59,7 @@ internal static class ServiceCollectionExtensions
             var client = sp.GetRequiredKeyedService<IKurrentClient>(name);
             var eventSerializer = sp.GetRequiredKeyedService<IEventConverterFactory>(name);
             var options = sp.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name);
-            return ActivatorUtilities.CreateInstance<KurrentGrainStorageProvider>(sp, client, eventSerializer, options.StreamNameProvider);
+            return ActivatorUtilities.CreateInstance<KurrentGrainStorageProvider>(sp, client, eventSerializer, options.StreamNameProvider, options.Retry);
         });
 
         // Configure log view adaptor.
