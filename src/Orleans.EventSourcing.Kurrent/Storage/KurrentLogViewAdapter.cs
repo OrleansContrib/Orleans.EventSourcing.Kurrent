@@ -115,6 +115,11 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         var maxCount = toVersion - fromVersion + 1; // inclusive range
 
+        // Captured before any await, while the adapter is known not to be disposed. Disposal always cancels
+        // disposeCts before disposing it, so a read still running then observes the cancellation and stops,
+        // including while it is backing off between retries.
+        var disposeToken = disposeCts.Token;
+
         try
         {
             // Retry the whole read, not just opening it: a leader change can fail the enumeration too.
@@ -130,7 +135,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
                 }
 
                 return result;
-            }, CancellationToken.None).ConfigureAwait(false);
+            }, disposeToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

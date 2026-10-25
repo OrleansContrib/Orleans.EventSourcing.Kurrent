@@ -505,6 +505,59 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             await adapter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         }
 
+        [Fact]
+        public async Task DisposeStopsRetrieveLogSegmentRetryingPromptly()
+        {
+            var slowRetry = new KurrentRetryOptions { MaxAttempts = 100, BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(slowRetry);
+
+            Assert.True(await adapter.TryAppend(new Applied(1)));
+
+            client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 100);
+            var segment = adapter.RetrieveLogSegment(0, 1);
+
+            // Lets the read fail and back off before the adapter is disposed
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+            await adapter.DisposeAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => segment.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        }
+
+        [Fact]
+        public async Task InMemoryClientMatchesKurrentIdempotentReplay()
+        {
+            // Mirrors what a real 3-node KurrentDB cluster returns for each of these
+            var client = new InMemoryKurrentClient();
+            var ct = TestContext.Current.CancellationToken;
+            EventData NewEvent() => new(Uuid.NewUuid(), "event", Array.Empty<byte>(), null);
+
+            var a = NewEvent();
+            var stream = $"replay-{Guid.NewGuid():N}";
+            Assert.Equal(ConditionalWriteStatus.Succeeded, (await client.ConditionalAppendToStreamAsync(stream, StreamState.NoStream, [a], ct)).Status);
+            Assert.Equal(ConditionalWriteStatus.Succeeded, (await client.ConditionalAppendToStreamAsync(stream, StreamState.StreamRevision(0), [NewEvent()], ct)).Status);
+
+            // A resend is still recognised after another writer appended behind it
+            var replayed = await client.ConditionalAppendToStreamAsync(stream, StreamState.NoStream, [a], ct);
+            Assert.Equal(ConditionalWriteStatus.Succeeded, replayed.Status);
+            Assert.Equal(StreamState.StreamRevision(0), replayed.NextExpectedStreamState);
+
+            var c = NewEvent();
+            var d = NewEvent();
+            var stream2 = $"replay-{Guid.NewGuid():N}";
+            Assert.Equal(ConditionalWriteStatus.Succeeded, (await client.ConditionalAppendToStreamAsync(stream2, StreamState.NoStream, [c, d], ct)).Status);
+
+            var whole = await client.ConditionalAppendToStreamAsync(stream2, StreamState.NoStream, [c, d], ct);
+            Assert.Equal(ConditionalWriteStatus.Succeeded, whole.Status);
+            Assert.Equal(StreamState.StreamRevision(1), whole.NextExpectedStreamState);
+
+            var prefix = await client.ConditionalAppendToStreamAsync(stream2, StreamState.NoStream, [c], ct);
+            Assert.Equal(ConditionalWriteStatus.Succeeded, prefix.Status);
+            Assert.Equal(StreamState.StreamRevision(0), prefix.NextExpectedStreamState);
+
+            Assert.Equal(ConditionalWriteStatus.VersionMismatch, (await client.ConditionalAppendToStreamAsync(stream2, StreamState.NoStream, [c, NewEvent()], ct)).Status);
+            Assert.Equal(2, (await client.ReadStreamAsync(Direction.Forwards, stream2, StreamPosition.Start, 10, false, ct)).ToBlockingEnumerable(ct).Count());
+        }
+
         [Theory]
         [MemberData(nameof(TransientExceptions))]
         public void TransientClassification(Exception exception, bool transient)

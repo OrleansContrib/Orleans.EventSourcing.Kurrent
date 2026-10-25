@@ -194,9 +194,11 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
             return false;
         }
 
+        // Real KurrentDB compares only the batch-length prefix after the expected revision: events appended
+        // later by another writer do not stop the batch being recognised as already written
         var written = events.Select(index => all[index])
                             .Where(e => e.EventNumber.ToInt64() > expected)
-                            .Take(eventData.Length + 1)
+                            .Take(eventData.Length)
                             .ToArray();
 
         if (written.Length != eventData.Length || !written.Select(e => e.EventId).SequenceEqual(eventData.Select(e => e.EventId)))
