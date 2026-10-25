@@ -85,8 +85,9 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
         };
         try
         {
+            var streamName = streamNameProvider.GetStreamName(stateName, grainId);
             var readResult = await kurrentClient.ReadStreamAsync(Direction.Backwards,
-                                                                  streamNameProvider.GetStreamName(stateName, grainId),
+                                                                  streamName,
                                                                   StreamPosition.End,
                                                                   2,
                                                                   false,
@@ -113,7 +114,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                 // A second event would indicate the stream metadata wasn't written successfully on the first write
                 if (await enumerator.MoveNextAsync().ConfigureAwait(false))
                 {
-                    await EnsureMetadataMaxCountSet(stateName, cancellationToken).ConfigureAwait(false);
+                    await EnsureMetadataMaxCountSet(streamName, cancellationToken).ConfigureAwait(false);
                 }
             }
             finally

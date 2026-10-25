@@ -137,6 +137,34 @@ public sealed class BasicTests : IAsyncLifetime
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_ReadHealsMissingMaxCountOnTheGrainsStream()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var stateName = $"heal-{Guid.NewGuid():N}";
+        var streamName = streamNameProvider.GetStreamName(stateName, grainId);
+
+        // Simulates a crash between the first append and setting $maxCount: the state is written but the metadata is not
+        kurrentClient.AddSetMetadataExceptionToThrowOnceForTesting(streamName, new Exception("simulated crash after append"));
+        await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.WriteStateAsync(stateName, grainId, new GrainState<GrainState>(new GrainState { Value = 1 }), TestContext.Current.CancellationToken));
+
+        var state = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync(stateName, grainId, state, TestContext.Current.CancellationToken);
+        state.State.Value = 2;
+        await GrainStorage.WriteStateAsync(stateName, grainId, state, TestContext.Current.CancellationToken);
+
+        // Two events and no $maxCount, so the read repairs the metadata
+        var reread = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync(stateName, grainId, reread, TestContext.Current.CancellationToken);
+        Assert.Equal(2, reread.State.Value);
+
+        var metadata = await kurrentClient.GetStreamMetadata(streamName, TestContext.Current.CancellationToken);
+        Assert.Equal(1, metadata.Metadata.MaxCount);
+
+        var misdirected = await kurrentClient.GetStreamMetadata(stateName, TestContext.Current.CancellationToken);
+        Assert.Null(misdirected.Metadata.MaxCount);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
     public async Task GrainStorage_CancelledDuringClear_ThrowsInconsistentState()
     {
         var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
