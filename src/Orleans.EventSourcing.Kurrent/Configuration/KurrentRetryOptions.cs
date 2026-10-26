@@ -19,4 +19,12 @@ public sealed class KurrentRetryOptions
     ///     The maximum delay between attempts.
     /// </summary>
     public TimeSpan MaxDelay { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    ///     The time budget for an operation, measured from when it started (for a queued write, from when it was
+    ///     submitted). A retry is only started if its delay plus a full attempt, bounded by the client's
+    ///     <c>DefaultDeadline</c>, still fits within it. Defaults to the Orleans response timeout, so that a retried
+    ///     operation finishes before the grain call that is waiting for it times out.
+    /// </summary>
+    public TimeSpan? MaxDuration { get; set; }
 }

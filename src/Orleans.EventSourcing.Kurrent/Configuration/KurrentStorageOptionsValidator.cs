@@ -27,5 +27,9 @@ internal sealed class KurrentStorageOptionsValidator(KurrentStorageOptions optio
         {
             throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentStorageOptions)} with name {name}. {nameof(KurrentStorageOptions)}.{nameof(_options.Retry)} requires 0 <= {nameof(KurrentRetryOptions.BaseDelay)} <= {nameof(KurrentRetryOptions.MaxDelay)}.");
         }
+        if (_options.Retry.MaxDuration <= TimeSpan.Zero)
+        {
+            throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentStorageOptions)} with name {name}. {nameof(KurrentStorageOptions)}.{nameof(_options.Retry)}.{nameof(KurrentRetryOptions.MaxDuration)} must be positive when set.");
+        }
     }
 }

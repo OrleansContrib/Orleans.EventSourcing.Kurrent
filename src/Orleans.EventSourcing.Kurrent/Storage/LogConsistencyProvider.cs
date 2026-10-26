@@ -11,18 +11,21 @@ internal sealed class LogConsistencyProvider : ILogViewAdaptorFactory
     private readonly IKurrentClient client;
     private readonly KurrentStorageOptions options;
     private readonly KurrentMetrics metrics;
+    private readonly KurrentRetryPolicy retry;
 
-    internal LogConsistencyProvider(IEventConverterFactory eventSerializer, IKurrentClient client, KurrentStorageOptions options, KurrentMetrics metrics)
+    internal LogConsistencyProvider(IEventConverterFactory eventSerializer, IKurrentClient client, KurrentStorageOptions options, KurrentMetrics metrics, KurrentRetryPolicy retry)
     {
         ArgumentNullException.ThrowIfNull(eventSerializer);
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(metrics);
+        ArgumentNullException.ThrowIfNull(retry);
 
         this.eventSerializer = eventSerializer;
         this.client = client;
         this.options = options;
         this.metrics = metrics;
+        this.retry = retry;
     }
 
     /// <inheritdoc />
@@ -31,7 +34,7 @@ internal sealed class LogConsistencyProvider : ILogViewAdaptorFactory
         where TLogEntry : class
     {
         ArgumentNullException.ThrowIfNull(services);
-        return new KurrentLogViewAdapter<TLogView, TLogEntry>(hostGrain, client, eventSerializer.GetEventConverter<TLogEntry>(), services, options.StreamNameProvider, metrics, options.Retry);
+        return new KurrentLogViewAdapter<TLogView, TLogEntry>(hostGrain, client, eventSerializer.GetEventConverter<TLogEntry>(), services, options.StreamNameProvider, metrics, retry);
     }
 
     /// <inheritdoc />

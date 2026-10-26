@@ -5,7 +5,6 @@ using KurrentDB.Client;
 
 using Orleans.Storage;
 
-using Orleans.EventSourcing.Kurrent.Configuration;
 using Orleans.EventSourcing.Kurrent.Observability;
 
 namespace Orleans.EventSourcing.Kurrent.Storage;
@@ -14,7 +13,7 @@ namespace Orleans.EventSourcing.Kurrent.Storage;
 ///      Kurrent-based log consistent storage provider.
 ///      Reads, writes and deletes are retried across a leader change (see <see cref="KurrentRetry"/>).
 /// </summary>
-internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, IEventConverterFactory eventSerializer, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics, KurrentRetryOptions retry) : IGrainStorage
+internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, IEventConverterFactory eventSerializer, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics, KurrentRetryPolicy retry) : IGrainStorage
 {
     private sealed record StoredState<T>(StreamState Revision, T State, bool HasOlderEvents);
 
@@ -50,6 +49,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     public async Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var startTimestamp = Stopwatch.GetTimestamp();
 
         if (grainState.RecordExists)
         {
@@ -60,7 +60,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                 {
                     // Resending a soft delete that already landed succeeds again, so an unknown outcome is safe to retry
                     var streamName = streamNameProvider.GetStreamName(stateName, grainId);
-                    _ = await KurrentRetry.ExecuteAsync(retry, metrics, "ClearState", token => kurrentClient.DeleteStreamAsync(streamName, streamState, token), cancellationToken).ConfigureAwait(false);
+                    _ = await KurrentRetry.ExecuteAsync(retry, "ClearState", token => kurrentClient.DeleteStreamAsync(streamName, streamState, token), cancellationToken, startTimestamp).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -82,6 +82,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     public async Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var startTimestamp = Stopwatch.GetTimestamp();
 
         var observabilityTags = new TagList
         {
@@ -94,7 +95,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             var streamName = streamNameProvider.GetStreamName(stateName, grainId);
 
             // Retry the whole read, not just opening it, and only update grainState once an attempt succeeds
-            var stored = await KurrentRetry.ExecuteAsync(retry, metrics, "ReadState", token => ReadLatestAsync<T>(streamName, observabilityTags, token), cancellationToken).ConfigureAwait(false);
+            var stored = await KurrentRetry.ExecuteAsync(retry, "ReadState", token => ReadLatestAsync<T>(streamName, observabilityTags, token), cancellationToken, startTimestamp).ConfigureAwait(false);
             if (stored is null)
             {
                 grainState.State = Activator.CreateInstance<T>();
@@ -110,7 +111,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             // A second event would indicate the stream metadata wasn't written successfully on the first write
             if (stored.HasOlderEvents)
             {
-                await EnsureMetadataMaxCountSet(streamName, cancellationToken).ConfigureAwait(false);
+                await EnsureMetadataMaxCountSet(streamName, startTimestamp, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (Exception ex) when (KurrentExceptionConverter.IsRequestedCancellation(ex, cancellationToken))
@@ -160,8 +161,8 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
 
     // We need to set the stream metadata to prevent the stream from growing indefinitely.
     // The read and the conditional write are retried together, so a retry after a write that did land sees MaxCount set and does nothing.
-    private Task EnsureMetadataMaxCountSet(string streamName, CancellationToken token)
-        => KurrentRetry.ExecuteAsync(retry, metrics, "SetMaxCount", t => SetMaxCountAsync(streamName, t), token);
+    private Task EnsureMetadataMaxCountSet(string streamName, long startTimestamp, CancellationToken token)
+        => KurrentRetry.ExecuteAsync(retry, "SetMaxCount", t => SetMaxCountAsync(streamName, t), token, startTimestamp);
 
     private async Task SetMaxCountAsync(string streamName, CancellationToken token)
     {
@@ -194,6 +195,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var startTimestamp = Stopwatch.GetTimestamp();
 
         var observabilityTags = new TagList
         {
@@ -218,10 +220,10 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             // Serialized once, so every attempt resends the same event ID at the same expected revision and Kurrent
             // acknowledges a resend of an append that already landed instead of writing it twice
             EventData[] events = [eventRecord];
-            var result = await KurrentRetry.ExecuteAsync(retry, metrics, "WriteState", token => kurrentClient.ConditionalAppendToStreamAsync(streamName,
+            var result = await KurrentRetry.ExecuteAsync(retry, "WriteState", token => kurrentClient.ConditionalAppendToStreamAsync(streamName,
                                                                                                                                             expectedStreamState,
                                                                                                                                             events,
-                                                                                                                                            cancellationToken: token), cancellationToken).ConfigureAwait(false);
+                                                                                                                                            cancellationToken: token), cancellationToken, startTimestamp).ConfigureAwait(false);
 
             switch (result.Status)
             {
@@ -245,7 +247,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             // We set it to 1, so we only retain the last event
             if (expectedStreamState == StreamState.NoStream)
             {
-                await EnsureMetadataMaxCountSet(streamName, cancellationToken).ConfigureAwait(false);
+                await EnsureMetadataMaxCountSet(streamName, startTimestamp, cancellationToken).ConfigureAwait(false);
             }
 
             grainState.RecordExists = true;

@@ -475,7 +475,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 Assert.True(await adapter.TryAppend(new Applied(1)));
 
                 // A retry would succeed, so the failure only surfaces if the append is not retried
-                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.PermissionDenied, "denied")));
 
                 var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
                 Assert.IsType<RpcException>(ex.InnerException);
@@ -490,10 +490,90 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
+        public async Task DeadlineExceededIsRetriedWhenTheBudgetAllows()
+        {
+            // A hard-killed leader leaves in-flight calls hanging until the client's deadline
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                client.AddExceptionToThrowForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "")), 2);
+
+                Assert.True(await adapter.TryAppend(new Applied(10)));
+                Assert.Equal(11, adapter.ConfirmedView.Balance);
+                Assert.Equal(2, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task NoRetryIsStartedThatCouldOverrunTheBudget()
+        {
+            // Another attempt could take the full 10s client deadline, which does not fit in a 5s budget
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(FastRetry, maxDuration: TimeSpan.FromSeconds(5), attemptTimeout: TimeSpan.FromSeconds(10)));
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                // A retry would succeed, so the failure only surfaces if the append is not retried
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "")));
+
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
+                Assert.Equal(StatusCode.DeadlineExceeded, Assert.IsType<RpcException>(ex.InnerException).StatusCode);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task AQueuedWritesBudgetCountsTimeSpentWaitingBehindEarlierWrites()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var blocking = new BlockingKurrentClient(new InMemoryKurrentClient());
+            var client = new ExceptionalKurrentClientWrapper(blocking);
+
+            // Budget 250ms with no client deadline: a retry fits if the write started less than ~250ms ago
+            var adapter = CreateAdapter(client, services, streamNameProvider, retry: Policy(FastRetry, maxDuration: TimeSpan.FromMilliseconds(250), attemptTimeout: TimeSpan.Zero));
+
+            try
+            {
+                blocking.BlockNextAppend();
+                adapter.Submit(new Applied(1));
+                await blocking.WaitForAppendToStart();
+
+                // Queued behind the blocked write; its first attempt fails once it gets to run
+                adapter.Submit(new Applied(10));
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+
+                await Task.Delay(400, TestContext.Current.CancellationToken);
+                blocking.ReleaseAppend();
+
+                // Measured from submission, the second write is already over budget, so it is not retried
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ConfirmSubmittedEntries());
+                Assert.Equal(StatusCode.Unavailable, Assert.IsType<RpcException>(ex.InnerException).StatusCode);
+                Assert.Equal(1, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
         public async Task DisposeStopsRetryingPromptly()
         {
             var slowRetry = new KurrentRetryOptions { MaxAttempts = 100, BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter(slowRetry);
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(slowRetry));
 
             Assert.True(await adapter.TryAppend(new Applied(1)));
 
@@ -509,7 +589,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         public async Task DisposeStopsRetrieveLogSegmentRetryingPromptly()
         {
             var slowRetry = new KurrentRetryOptions { MaxAttempts = 100, BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter(slowRetry);
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(slowRetry));
 
             Assert.True(await adapter.TryAppend(new Applied(1)));
 
@@ -571,7 +651,8 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0, "The HTTP/2 server closed the connection.", null))), true },
             { new RpcException(new Status(StatusCode.Internal, "internal")), false },
             { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
-            { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },
+            { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), true },
+            { new RpcException(new Status(StatusCode.PermissionDenied, "denied")), false },
             { new WrongExpectedVersionException("stream", StreamState.NoStream, StreamState.StreamRevision(1)), false },
             { new OperationCanceledException(), false },
             { new TimeoutException(), false },
@@ -579,12 +660,16 @@ namespace Orleans.EventSourcing.Kurrent.Tests
 
         private static readonly KurrentRetryOptions FastRetry = new() { MaxAttempts = 5, BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(5) };
 
-        private static (KurrentLogViewAdapter<TestView, TestLogEntry> Adapter, ExceptionalKurrentClientWrapper Client, string StreamName) CreateLeaderChangeAdapter(KurrentRetryOptions? retry = null)
+        // A 30s budget (the Orleans response timeout) and a 10s client deadline, as with the defaults
+        private static KurrentRetryPolicy Policy(KurrentRetryOptions options, TimeSpan? maxDuration = null, TimeSpan? attemptTimeout = null)
+            => new(options, Metrics, maxDuration ?? TimeSpan.FromSeconds(30), attemptTimeout ?? TimeSpan.FromSeconds(10));
+
+        private static (KurrentLogViewAdapter<TestView, TestLogEntry> Adapter, ExceptionalKurrentClientWrapper Client, string StreamName) CreateLeaderChangeAdapter(KurrentRetryPolicy? retry = null)
         {
             var streamNameProvider = new KurrentStreamName();
             var services = new TestLogConsistencyProtocolServices();
             var client = new ExceptionalKurrentClientWrapper(new InMemoryKurrentClient());
-            var adapter = CreateAdapter(client, services, streamNameProvider, retry: retry ?? FastRetry);
+            var adapter = CreateAdapter(client, services, streamNameProvider, retry: retry ?? Policy(FastRetry));
             return (adapter, client, streamNameProvider.GetStreamName(services.GrainId));
         }
 
@@ -592,14 +677,14 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                                                                                     TestLogConsistencyProtocolServices services,
                                                                                     IKurrentStreamNameProvider streamNameProvider,
                                                                                     TestEventSerializer? serializer = null,
-                                                                                    KurrentRetryOptions? retry = null)
+                                                                                    KurrentRetryPolicy? retry = null)
             => new(new TestLogViewAdaptorHost(),
                    client,
                    serializer ?? new TestEventSerializer(),
                    services,
                    streamNameProvider,
                    Metrics,
-                   retry ?? new KurrentRetryOptions());
+                   retry ?? Policy(new KurrentRetryOptions()));
 
         // The same default IMeterFactory that Orleans registers for silos and clients
         private static readonly KurrentMetrics Metrics = new(new ServiceCollection().AddMetrics().BuildServiceProvider().GetRequiredService<IMeterFactory>());

@@ -254,7 +254,7 @@ public sealed class BasicTests : IAsyncLifetime
         var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
 
         // A retry would succeed, so the failure only surfaces if the write is not retried
-        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName("test", grainId), new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName("test", grainId), new RpcException(new Status(StatusCode.PermissionDenied, "denied")));
 
         var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.WriteStateAsync("test", grainId, new GrainState<GrainState>(new GrainState { Value = 1 }), TestContext.Current.CancellationToken));
         Assert.IsType<RpcException>(ex.InnerException);
@@ -452,7 +452,7 @@ public sealed class BasicTests : IAsyncLifetime
 
         await account.Deposit(22, TestContext.Current.CancellationToken);
 
-        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new RpcException(new Status(StatusCode.DeadlineExceeded, "RPC timeout blah blah")));
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new RpcException(new Status(StatusCode.PermissionDenied, "RPC permission denied")));
 
         await account.DepositWithoutConfirm(33, TestContext.Current.CancellationToken); // exception will be seen on following write
 
