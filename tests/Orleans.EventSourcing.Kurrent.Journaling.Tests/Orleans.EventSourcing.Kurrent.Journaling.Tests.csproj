@@ -6,8 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
-    <!-- Microsoft.Orleans.Journaling requires Orleans 10.4, so the test host must match it. -->
-    <PackageReference Include="Microsoft.Orleans.TestingHost" VersionOverride="10.4.0" />
+    <PackageReference Include="Microsoft.Orleans.TestingHost" />
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio" />
   </ItemGroup>

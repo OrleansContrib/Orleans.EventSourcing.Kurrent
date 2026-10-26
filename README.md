@@ -27,7 +27,7 @@ The reminders provider is shipped as a separate package:
 dotnet add package Orleans.EventSourcing.Kurrent.Reminders
 ```
 
-The Orleans Journaling storage provider is shipped as a separate prerelease package, because Orleans Journaling itself is only published as a prerelease (it requires Orleans 10.4):
+The Orleans Journaling storage provider is shipped as a separate prerelease package, because Orleans Journaling itself is only published as a prerelease:
 
 ```sh
 dotnet add package Orleans.EventSourcing.Kurrent.Journaling --prerelease
@@ -266,7 +266,7 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 
 ## Journaling storage provider - Experimental
 
-[Orleans Journaling](https://github.com/dotnet/orleans/tree/main/src/Orleans.Journaling) persists durable grain state (`IDurableStateManager`, `DurableGrain`, `IDurableDictionary`, `IDurableList`, `IDurableValue` and friends) as a journal of operations plus periodic snapshots. This provider stores each journal in its own KurrentDB stream. It ships as a **separate package** because Orleans Journaling is only published as a prerelease and requires Orleans 10.4:
+[Orleans Journaling](https://github.com/dotnet/orleans/tree/main/src/Orleans.Journaling) persists durable grain state (`IDurableStateManager`, `DurableGrain`, `IDurableDictionary`, `IDurableList`, `IDurableValue` and friends) as a journal of operations plus periodic snapshots. This provider stores each journal in its own KurrentDB stream. It ships as a **separate package** because Orleans Journaling is only published as a prerelease:
 
 ```sh
 dotnet add package Orleans.EventSourcing.Kurrent.Journaling --prerelease

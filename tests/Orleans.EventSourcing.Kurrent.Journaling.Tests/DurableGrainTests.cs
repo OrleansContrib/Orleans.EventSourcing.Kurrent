@@ -2,10 +2,14 @@ using System.Text.Json.Serialization;
 
 using KurrentDB.Client;
 
+using Microsoft.Extensions.DependencyInjection;
+
 using Orleans.Core.Internal;
 using Orleans.EventSourcing.Kurrent.Storage;
 using Orleans.Journaling;
 using Orleans.Journaling.Json;
+using Orleans.Serialization;
+using Orleans.Storage;
 using Orleans.TestingHost;
 
 namespace Orleans.EventSourcing.Kurrent.Journaling.Tests;
@@ -118,6 +122,21 @@ public sealed class DurableGrainTests : IAsyncLifetime
         await cart.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
 
         Assert.Equal(new Dictionary<string, int> { ["pear"] = 2 }, await cart.GetItems());
+    }
+
+    [Fact(Timeout = TestTimeout)]
+    public void ConflictExceptionSurvivesGrainCallSerialization()
+    {
+        // A journal write conflict surfaces to grain callers as InconsistentStateException wrapping the Kurrent
+        // exception, so Orleans must be able to serialize that inner exception across the grain call.
+        var serializer = cluster.Client.ServiceProvider.GetRequiredService<Serializer>();
+        var conflict = new InconsistentStateException("conflict", "1", "0",
+            new WrongExpectedVersionException("orleansjournal-x", StreamState.StreamRevision(0), StreamState.StreamRevision(1)));
+
+        var roundTripped = serializer.Deserialize<Exception>(serializer.SerializeToArray<Exception>(conflict));
+
+        var inconsistent = Assert.IsType<InconsistentStateException>(roundTripped);
+        Assert.IsType<WrongExpectedVersionException>(inconsistent.InnerException);
     }
 }
 
