@@ -266,6 +266,32 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 | `ClientSettings` | `KurrentDBClientSettings` used to build the underlying `KurrentClient`. |
 | `GrainStorageSerializer` | Orleans' `IGrainStorageSerializer` used by the default event serializer. |
 | `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `KurrentStreamName.Default`. |
+| `Retry` | `KurrentRetryOptions` controlling how the storage providers retry across a KurrentDB leader change. See below. |
+
+### Riding out a leader change
+
+When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. Both storage providers (and so the reminders provider, which is built on the log-consistency provider) retry those requests, so a leader change shows up as extra latency rather than failed grain calls. They retry `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures and calls cut off by the old leader closing its connection, with exponential backoff and jitter. Other failures, and cancellation, are not retried.
+
+That includes `DeadlineExceeded`, which is how calls in flight to a leader that died without closing its connections end. The client does not reconnect after it, so a retry would hang on the same dead connection, and those calls fail when the client's `DefaultDeadline` expires.
+
+- Log-consistency provider: appends, stream loads, `RetrieveLogSegment`, truncation metadata updates and tombstones.
+- Grain storage provider: state reads, writes and clears, and the `$maxCount` metadata update.
+
+| `Retry` property | Default | Description |
+| --- | --- | --- |
+| `MaxAttempts` | `13` | Maximum attempts, including the first. `1` disables retries. |
+| `BaseDelay` | `100ms` | Delay before the first retry; doubles on each attempt after that. |
+| `MaxDelay` | `2s` | Upper bound on the delay between attempts. |
+| `MaxDuration` | Orleans response timeout | Time budget for an operation whose caller cannot cancel it, from when it started (for a queued write, from when it was submitted). A retry is only started if its delay plus a full attempt, which can last up to the client's `DefaultDeadline`, still fits within it. |
+
+The default attempts and delays keep retrying for roughly 10 to 19 seconds; in testing a 3-node cluster took 7 to 11 seconds to elect a new leader after the old one was stopped.
+
+How long an operation may keep retrying depends on whether its caller can cancel it:
+
+- If the caller passes a cancellable token, such as to `IGrainStorage` or `ClearLogAsync`, the caller decides how long to wait. `MaxDuration` does not apply, and retries are limited by `MaxAttempts` and the token.
+- Otherwise, as with `JournaledGrain` writes and activation loads or a storage call made with `CancellationToken.None`, `MaxDuration` also applies, so that a retried operation finishes before the grain call waiting for it times out. With the default 30s response timeout and the client's default 10s deadline, a retry is started only while less than about 20 seconds have passed.
+
+Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again, and a tombstone that already landed is treated as done. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
 
 ### Custom event stream naming
 

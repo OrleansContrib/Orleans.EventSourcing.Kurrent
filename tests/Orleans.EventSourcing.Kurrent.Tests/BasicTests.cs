@@ -165,6 +165,147 @@ public sealed class BasicTests : IAsyncLifetime
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_NotLeaderOnRead_IsRetried()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        await GrainStorage.WriteStateAsync("test", grainId, new GrainState<GrainState>(new GrainState { Value = 7 }), TestContext.Current.CancellationToken);
+
+        kurrentClient.AddExceptionToThrowForTesting(streamNameProvider.GetStreamName("test", grainId), new NotLeaderException("localhost", 2313), 2);
+
+        var state = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.True(state.RecordExists);
+        Assert.Equal(7, state.State.Value);
+        Assert.Equal("0", state.ETag);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_NotLeaderOnWrite_IsRetried()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+
+        kurrentClient.AddExceptionToThrowForTesting(streamNameProvider.GetStreamName("test", grainId), new NotLeaderException("localhost", 2313), 2);
+
+        state.State.Value = 2;
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.Equal("1", state.ETag);
+
+        var reread = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync("test", grainId, reread, TestContext.Current.CancellationToken);
+        Assert.Equal(2, reread.State.Value);
+        Assert.Equal("1", reread.ETag);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_WriteWhoseReplyWasLost_IsRetriedWithoutDuplicating()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var streamName = streamNameProvider.GetStreamName("test", grainId);
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+
+        // The first write lands but its reply is lost; the retry resends the same event ID
+        kurrentClient.AddExceptionToThrowAfterWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.Equal("0", state.ETag);
+
+        // $maxCount is still set after the first write
+        var metadata = await kurrentClient.GetStreamMetadata(streamName, TestContext.Current.CancellationToken);
+        Assert.Equal(1, metadata.Metadata.MaxCount);
+
+        kurrentClient.AddExceptionToThrowAfterWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+        state.State.Value = 2;
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.Equal("1", state.ETag);
+
+        var reread = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync("test", grainId, reread, TestContext.Current.CancellationToken);
+        Assert.Equal(2, reread.State.Value);
+        Assert.Equal("1", reread.ETag);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_ClearAcrossLeaderChange_IsRetried()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var streamName = streamNameProvider.GetStreamName("test", grainId);
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+
+        kurrentClient.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 1);
+        await GrainStorage.ClearStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.False(state.RecordExists);
+
+        // A second clear whose delete lands but whose reply is lost; resending a soft delete succeeds again
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        kurrentClient.AddExceptionToThrowAfterWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+        await GrainStorage.ClearStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.False(state.RecordExists);
+
+        var reread = new GrainState<GrainState>();
+        await GrainStorage.ReadStateAsync("test", grainId, reread, TestContext.Current.CancellationToken);
+        Assert.False(reread.RecordExists);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_NonTransientFailures_AreNotRetried()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+
+        // A retry would succeed, so the failure only surfaces if the write is not retried
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName("test", grainId), new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
+
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.WriteStateAsync("test", grainId, new GrainState<GrainState>(new GrainState { Value = 1 }), TestContext.Current.CancellationToken));
+        Assert.IsType<RpcException>(ex.InnerException);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_TimeBudgetOnlyAppliesWithoutACancellableToken()
+    {
+        var serviceProvider = cluster.GetSiloServiceProvider();
+        var metrics = serviceProvider.GetRequiredService<KurrentMetrics>();
+
+        // A retry could take the 10s client deadline, which never fits in a 1s budget
+        var retry = new KurrentRetryPolicy(new Configuration.KurrentRetryOptions(), metrics, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10));
+        var storage = new KurrentGrainStorageProvider(kurrentClient,
+                                                      serviceProvider.GetRequiredKeyedService<IEventConverterFactory>(ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME),
+                                                      streamNameProvider,
+                                                      metrics,
+                                                      retry);
+
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var streamName = streamNameProvider.GetStreamName("test", grainId);
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => storage.WriteStateAsync("test", grainId, state, CancellationToken.None));
+        Assert.IsType<NotLeaderException>(ex.InnerException);
+
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+        using var cancellation = new CancellationTokenSource();
+        await storage.WriteStateAsync("test", grainId, state, cancellation.Token);
+        Assert.Equal("0", state.ETag);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task StateGrain_ActivatesAndWritesAcrossLeaderChange()
+    {
+        var stateGrain = cluster.Client.GetGrain<IStateGrain>(Guid.NewGuid());
+        var streamName = streamNameProvider.GetStreamName("test", stateGrain.GetGrainId());
+        await stateGrain.SetValue(5, TestContext.Current.CancellationToken);
+        await stateGrain.AsReference<IGrainManagementExtension>().DeactivateOnIdle(TestContext.Current.CancellationToken);
+
+        // Activation reads the state from the old leader first
+        kurrentClient.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 2);
+        Assert.Equal(5, await stateGrain.GetValue(TestContext.Current.CancellationToken));
+
+        kurrentClient.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), 2);
+        await stateGrain.SetValue(6, TestContext.Current.CancellationToken);
+        Assert.Equal(6, await stateGrain.GetValue(TestContext.Current.CancellationToken));
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
     public async Task GrainStorage_CancelledDuringClear_ThrowsInconsistentState()
     {
         var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));

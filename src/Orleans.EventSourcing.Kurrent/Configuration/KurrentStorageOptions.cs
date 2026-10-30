@@ -27,4 +27,9 @@ public sealed class KurrentStorageOptions : IStorageProviderSerializerOptions
     ///     Replace with a custom <see cref="IKurrentStreamNameProvider"/> to change the naming scheme.
     /// </summary>
     public IKurrentStreamNameProvider StreamNameProvider { get; set; } = new KurrentStreamName();
+
+    /// <summary>
+    ///     Controls how log-consistency reads and writes are retried when the Kurrent cluster changes leader.
+    /// </summary>
+    public KurrentRetryOptions Retry { get; set; } = new();
 }

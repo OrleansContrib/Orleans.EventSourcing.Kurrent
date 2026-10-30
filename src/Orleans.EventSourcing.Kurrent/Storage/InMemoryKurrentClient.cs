@@ -132,6 +132,13 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
             // StreamState.Any means "no optimistic-concurrency check": accept the append regardless of the current revision.
             if (expectedRevision != StreamState.Any && streamState != expectedRevision && !isSoftDeleted)
             {
+                // Real KurrentDB: resending a batch that already landed after the expected revision, with the
+                // same event IDs, is acknowledged without writing it twice.
+                if (events is not null && TryGetIdempotentReplayState(events, expectedRevision, eventData.ToArray(), out var replayedState))
+                {
+                    return (ConditionalWriteResult)ConditionalWriteResultConstructor.Invoke([replayedState, default, ConditionalWriteStatus.Succeeded,]);
+                }
+
                 // mismatch and return with expectedRevision (since it didn't change)
                 return (ConditionalWriteResult)ConditionalWriteResultConstructor.Invoke([streamState, default, ConditionalWriteStatus.VersionMismatch,]);
             }
@@ -174,6 +181,33 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
         {
             singleAccess.Release();
         }
+    }
+
+    private bool TryGetIdempotentReplayState(List<int> events, StreamState expectedRevision, EventData[] eventData, out StreamState replayedState)
+    {
+        replayedState = default;
+
+        // Only NoStream (-1) or a concrete revision identify where the original batch was written
+        var expected = expectedRevision.ToInt64();
+        if (expected < -1 || eventData.Length == 0)
+        {
+            return false;
+        }
+
+        // Real KurrentDB compares only the batch-length prefix after the expected revision: events appended
+        // later by another writer do not stop the batch being recognised as already written
+        var written = events.Select(index => all[index])
+                            .Where(e => e.EventNumber.ToInt64() > expected)
+                            .Take(eventData.Length)
+                            .ToArray();
+
+        if (written.Length != eventData.Length || !written.Select(e => e.EventId).SequenceEqual(eventData.Select(e => e.EventId)))
+        {
+            return false;
+        }
+
+        replayedState = StreamState.StreamRevision(written[^1].EventNumber);
+        return true;
     }
 
     private static EventRecord CreateEventRecord(EventData eventData, string eventStreamId, StreamPosition eventNumber, Position position)
@@ -358,6 +392,12 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
         await singleAccess.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            // Real KurrentDB: tombstoning an already tombstoned stream fails, even at the same expected revision
+            if (tombstoned.Contains(streamName))
+            {
+                throw new StreamDeletedException(streamName);
+            }
+
             if (!streams.TryGetValue(streamName, out var events))
             {
                 return new DeleteResult();
