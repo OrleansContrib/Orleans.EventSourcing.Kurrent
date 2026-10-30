@@ -17,7 +17,7 @@ public sealed class KurrentRetryTests
 {
     private static readonly KurrentMetrics Metrics = new(new ServiceCollection().AddMetrics().BuildServiceProvider().GetRequiredService<IMeterFactory>());
 
-    private static readonly Exception DeadlineExceeded = new RpcException(new Status(StatusCode.DeadlineExceeded, ""));
+    private static readonly Exception Unavailable = new RpcException(new Status(StatusCode.Unavailable, ""));
 
     // No jitter worth speaking of: delays are 1-2ms
     private static readonly KurrentRetryOptions Options = new() { MaxAttempts = 10, BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(2) };
@@ -30,7 +30,7 @@ public sealed class KurrentRetryTests
     {
         var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(10));
 
-        Assert.Equal(expected, KurrentRetry.ShouldRetry(policy, 1, DeadlineExceeded, TimeSpan.FromSeconds(elapsedSeconds), CancellationToken.None, out _));
+        Assert.Equal(expected, KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromSeconds(elapsedSeconds), callerCanCancel: false, CancellationToken.None, out _));
     }
 
     [Fact]
@@ -38,8 +38,16 @@ public sealed class KurrentRetryTests
     {
         var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), AttemptTimeout: null);
 
-        Assert.True(KurrentRetry.ShouldRetry(policy, 1, DeadlineExceeded, TimeSpan.FromSeconds(29.9), CancellationToken.None, out _));
-        Assert.False(KurrentRetry.ShouldRetry(policy, 1, DeadlineExceeded, TimeSpan.FromSeconds(30), CancellationToken.None, out _));
+        Assert.True(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromSeconds(29.9), callerCanCancel: false, CancellationToken.None, out _));
+        Assert.False(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromSeconds(30), callerCanCancel: false, CancellationToken.None, out _));
+    }
+
+    [Fact]
+    public void ACallerThatCanCancelIsNotHeldToTheBudget()
+    {
+        var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(10));
+
+        Assert.True(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromHours(1), callerCanCancel: true, CancellationToken.None, out _));
     }
 
     [Fact]
@@ -47,9 +55,9 @@ public sealed class KurrentRetryTests
     {
         var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(10));
 
-        Assert.False(KurrentRetry.ShouldRetry(policy, Options.MaxAttempts, DeadlineExceeded, TimeSpan.Zero, CancellationToken.None, out _));
-        Assert.False(KurrentRetry.ShouldRetry(policy, 1, DeadlineExceeded, TimeSpan.Zero, new CancellationToken(canceled: true), out _));
-        Assert.False(KurrentRetry.ShouldRetry(policy, 1, new RpcException(new Status(StatusCode.PermissionDenied, "")), TimeSpan.Zero, CancellationToken.None, out _));
+        Assert.False(KurrentRetry.ShouldRetry(policy, Options.MaxAttempts, Unavailable, TimeSpan.Zero, callerCanCancel: true, CancellationToken.None, out _));
+        Assert.False(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.Zero, callerCanCancel: true, new CancellationToken(canceled: true), out _));
+        Assert.False(KurrentRetry.ShouldRetry(policy, 1, new RpcException(new Status(StatusCode.PermissionDenied, "")), TimeSpan.Zero, callerCanCancel: true, CancellationToken.None, out _));
     }
 
     [Fact]

@@ -475,35 +475,13 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 Assert.True(await adapter.TryAppend(new Applied(1)));
 
                 // A retry would succeed, so the failure only surfaces if the append is not retried
-                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.PermissionDenied, "denied")));
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
 
                 var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
                 Assert.IsType<RpcException>(ex.InnerException);
 
                 await adapter.Synchronize();
                 Assert.Equal(1, adapter.ConfirmedVersion);
-            }
-            finally
-            {
-                adapter.Dispose();
-            }
-        }
-
-        [Fact]
-        public async Task DeadlineExceededIsRetriedWhenTheBudgetAllows()
-        {
-            // A hard-killed leader leaves in-flight calls hanging until the client's deadline
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
-
-            try
-            {
-                Assert.True(await adapter.TryAppend(new Applied(1)));
-
-                client.AddExceptionToThrowForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "")), 2);
-
-                Assert.True(await adapter.TryAppend(new Applied(10)));
-                Assert.Equal(11, adapter.ConfirmedView.Balance);
-                Assert.Equal(2, adapter.ConfirmedVersion);
             }
             finally
             {
@@ -522,10 +500,36 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 Assert.True(await adapter.TryAppend(new Applied(1)));
 
                 // A retry would succeed, so the failure only surfaces if the append is not retried
-                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "")));
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
 
                 var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
-                Assert.Equal(StatusCode.DeadlineExceeded, Assert.IsType<RpcException>(ex.InnerException).StatusCode);
+                Assert.Equal(StatusCode.Unavailable, Assert.IsType<RpcException>(ex.InnerException).StatusCode);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ACancellableCallerTokenTakesThePlaceOfTheBudget()
+        {
+            // No retry fits in this budget, so a retry can only happen if the budget does not apply
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(FastRetry, maxDuration: TimeSpan.FromSeconds(5), attemptTimeout: TimeSpan.FromSeconds(10)));
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                // The adapter's own linked token can always be cancelled, but the caller's cannot
+                client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(CancellationToken.None));
+                Assert.IsType<NotLeaderException>(ex.InnerException);
+
+                using var cancellation = new CancellationTokenSource();
+                client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+                await adapter.ClearLogAsync(cancellation.Token);
+                Assert.Equal(0, adapter.ConfirmedVersion);
             }
             finally
             {
@@ -651,7 +655,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0, "The HTTP/2 server closed the connection.", null))), true },
             { new RpcException(new Status(StatusCode.Internal, "internal")), false },
             { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
-            { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), true },
+            { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },
             { new RpcException(new Status(StatusCode.PermissionDenied, "denied")), false },
             { new WrongExpectedVersionException("stream", StreamState.NoStream, StreamState.StreamRevision(1)), false },
             { new OperationCanceledException(), false },

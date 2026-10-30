@@ -254,10 +254,38 @@ public sealed class BasicTests : IAsyncLifetime
         var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
 
         // A retry would succeed, so the failure only surfaces if the write is not retried
-        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName("test", grainId), new RpcException(new Status(StatusCode.PermissionDenied, "denied")));
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName("test", grainId), new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
 
         var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.WriteStateAsync("test", grainId, new GrainState<GrainState>(new GrainState { Value = 1 }), TestContext.Current.CancellationToken));
         Assert.IsType<RpcException>(ex.InnerException);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_TimeBudgetOnlyAppliesWithoutACancellableToken()
+    {
+        var serviceProvider = cluster.GetSiloServiceProvider();
+        var metrics = serviceProvider.GetRequiredService<KurrentMetrics>();
+
+        // A retry could take the 10s client deadline, which never fits in a 1s budget
+        var retry = new KurrentRetryPolicy(new Configuration.KurrentRetryOptions(), metrics, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10));
+        var storage = new KurrentGrainStorageProvider(kurrentClient,
+                                                      serviceProvider.GetRequiredKeyedService<IEventConverterFactory>(ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME),
+                                                      streamNameProvider,
+                                                      metrics,
+                                                      retry);
+
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var streamName = streamNameProvider.GetStreamName("test", grainId);
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => storage.WriteStateAsync("test", grainId, state, CancellationToken.None));
+        Assert.IsType<NotLeaderException>(ex.InnerException);
+
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+        using var cancellation = new CancellationTokenSource();
+        await storage.WriteStateAsync("test", grainId, state, cancellation.Token);
+        Assert.Equal("0", state.ETag);
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
@@ -452,7 +480,7 @@ public sealed class BasicTests : IAsyncLifetime
 
         await account.Deposit(22, TestContext.Current.CancellationToken);
 
-        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new RpcException(new Status(StatusCode.PermissionDenied, "RPC permission denied")));
+        kurrentClient.AddExceptionToThrowOnceForTesting(streamNameProvider.GetStreamName(account.GetGrainId()), new RpcException(new Status(StatusCode.DeadlineExceeded, "RPC timeout blah blah")));
 
         await account.DepositWithoutConfirm(33, TestContext.Current.CancellationToken); // exception will be seen on following write
 

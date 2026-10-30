@@ -60,7 +60,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                 {
                     // Resending a soft delete that already landed succeeds again, so an unknown outcome is safe to retry
                     var streamName = streamNameProvider.GetStreamName(stateName, grainId);
-                    _ = await KurrentRetry.ExecuteAsync(retry, "ClearState", token => kurrentClient.DeleteStreamAsync(streamName, streamState, token), cancellationToken, startTimestamp).ConfigureAwait(false);
+                    _ = await KurrentRetry.ExecuteAsync(retry, "ClearState", token => kurrentClient.DeleteStreamAsync(streamName, streamState, token), startTimestamp, cancellationToken, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -95,7 +95,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             var streamName = streamNameProvider.GetStreamName(stateName, grainId);
 
             // Retry the whole read, not just opening it, and only update grainState once an attempt succeeds
-            var stored = await KurrentRetry.ExecuteAsync(retry, "ReadState", token => ReadLatestAsync<T>(streamName, observabilityTags, token), cancellationToken, startTimestamp).ConfigureAwait(false);
+            var stored = await KurrentRetry.ExecuteAsync(retry, "ReadState", token => ReadLatestAsync<T>(streamName, observabilityTags, token), startTimestamp, cancellationToken, cancellationToken).ConfigureAwait(false);
             if (stored is null)
             {
                 grainState.State = Activator.CreateInstance<T>();
@@ -162,7 +162,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
     // We need to set the stream metadata to prevent the stream from growing indefinitely.
     // The read and the conditional write are retried together, so a retry after a write that did land sees MaxCount set and does nothing.
     private Task EnsureMetadataMaxCountSet(string streamName, long startTimestamp, CancellationToken token)
-        => KurrentRetry.ExecuteAsync(retry, "SetMaxCount", t => SetMaxCountAsync(streamName, t), token, startTimestamp);
+        => KurrentRetry.ExecuteAsync(retry, "SetMaxCount", t => SetMaxCountAsync(streamName, t), startTimestamp, token, token);
 
     private async Task SetMaxCountAsync(string streamName, CancellationToken token)
     {
@@ -223,7 +223,7 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
             var result = await KurrentRetry.ExecuteAsync(retry, "WriteState", token => kurrentClient.ConditionalAppendToStreamAsync(streamName,
                                                                                                                                             expectedStreamState,
                                                                                                                                             events,
-                                                                                                                                            cancellationToken: token), cancellationToken, startTimestamp).ConfigureAwait(false);
+                                                                                                                                            cancellationToken: token), startTimestamp, cancellationToken, cancellationToken).ConfigureAwait(false);
 
             switch (result.Status)
             {
