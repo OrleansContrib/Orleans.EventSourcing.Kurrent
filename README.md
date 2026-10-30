@@ -279,17 +279,17 @@ That includes `DeadlineExceeded`, which is how calls in flight to a leader that 
 
 | `Retry` property | Default | Description |
 | --- | --- | --- |
-| `MaxAttempts` | `13` | Maximum attempts, including the first. `1` disables retries. |
-| `BaseDelay` | `100ms` | Delay before the first retry; doubles on each attempt after that. |
+| `BaseDelay` | `100ms` | Delay before the first retry; doubles on each attempt after that. Must be greater than zero. |
 | `MaxDelay` | `2s` | Upper bound on the delay between attempts. |
-| `MaxDuration` | Orleans response timeout | Time budget for an operation whose caller cannot cancel it, from when it started (for a queued write, from when it was submitted). A retry is only started if its delay plus a full attempt, which can last up to the client's `DefaultDeadline`, still fits within it. |
 
-The default attempts and delays keep retrying for roughly 10 to 19 seconds; in testing a 3-node cluster took 7 to 11 seconds to elect a new leader after the old one was stopped.
+How long an operation may run depends on whether its caller can cancel it:
 
-How long an operation may keep retrying depends on whether its caller can cancel it:
+- If the caller passes a cancellable token, such as to `IGrainStorage` or `ClearLogAsync`, the caller decides how long to wait. Retries continue for as long as the failure lasts, until that token fires. A token you never cancel means retrying indefinitely. That includes the token Orleans gives a grain method: it isn't cancelled when the call times out unless you set `MessagingOptions.CancelRequestOnTimeout`.
+- Otherwise, as with `JournaledGrain` writes and activation loads or a storage call made with `CancellationToken.None`, the operation is cancelled after the Orleans `ResponseTimeout` (30s by default) and fails with a `TimeoutException` inside an `InconsistentStateException`. A write cut short this way may still have landed, so as with any write that fails, the log adapter treats the stream state as unknown until it reloads. The time is measured separately for each step of an operation, such as an append and the truncation update that follows it, and starts when that step starts running, not when it was queued.
 
-- If the caller passes a cancellable token, such as to `IGrainStorage` or `ClearLogAsync`, the caller decides how long to wait. `MaxDuration` does not apply, and retries are limited by `MaxAttempts` and the token.
-- Otherwise, as with `JournaledGrain` writes and activation loads or a storage call made with `CancellationToken.None`, `MaxDuration` also applies, so that a retried operation finishes before the grain call waiting for it times out. With the default 30s response timeout and the client's default 10s deadline, a retry is started only while less than about 20 seconds have passed.
+Reading a whole stream (a `JournaledGrain` load or `RetrieveLogSegment`) is the exception to the timeout. The client sets no deadline on those and a long stream can legitimately take longer than any timeout, so the timeout only stops a failed read being retried, not a read in progress.
+
+Each attempt is separately limited by the client: `DefaultDeadline` (10s by default) applies to everything except streaming reads, and gRPC keepalive detects a dead connection after about 20 seconds.
 
 Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again, and a tombstone that already landed is treated as done. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
 

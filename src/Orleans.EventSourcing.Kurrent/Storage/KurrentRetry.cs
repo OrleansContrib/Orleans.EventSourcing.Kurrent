@@ -14,27 +14,29 @@ using Orleans.EventSourcing.Kurrent.Observability;
 namespace Orleans.EventSourcing.Kurrent.Storage;
 
 /// <summary>
-///     How a provider retries: the configured options, the time budget for an operation and the longest a
-///     single attempt can take.
+///     How a provider retries: the backoff to use and how long an operation may run if its caller cannot cancel it.
 /// </summary>
-/// <param name="Options">Attempts and backoff.</param>
+/// <param name="Options">Backoff between attempts.</param>
 /// <param name="Metrics">Where retries are counted.</param>
-/// <param name="MaxDuration">Time budget for an operation whose caller cannot cancel it, from when it started.</param>
-/// <param name="AttemptTimeout">The longest one attempt can take (the client's deadline), or null if unbounded.</param>
-internal sealed record KurrentRetryPolicy(KurrentRetryOptions Options, KurrentMetrics Metrics, TimeSpan MaxDuration, TimeSpan? AttemptTimeout)
+/// <param name="Timeout">How long an operation may run if its caller cannot cancel it.</param>
+internal sealed record KurrentRetryPolicy(KurrentRetryOptions Options, KurrentMetrics Metrics, TimeSpan Timeout)
 {
     /// <summary>
     ///     The Orleans default response timeout, used when the silo's messaging options are not available.
     /// </summary>
     private static readonly TimeSpan DefaultResponseTimeout = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    ///     The longest delay <see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/> accepts.
+    /// </summary>
+    private static readonly TimeSpan MaxTimeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
     public static KurrentRetryPolicy Create(IServiceProvider serviceProvider, KurrentStorageOptions options)
     {
         var responseTimeout = serviceProvider.GetService<IOptions<SiloMessagingOptions>>()?.Value.ResponseTimeout ?? DefaultResponseTimeout;
         return new KurrentRetryPolicy(options.Retry,
                                       serviceProvider.GetRequiredService<KurrentMetrics>(),
-                                      options.Retry.MaxDuration ?? responseTimeout,
-                                      options.ClientSettings?.DefaultDeadline);
+                                      responseTimeout > MaxTimeout ? System.Threading.Timeout.InfiniteTimeSpan : responseTimeout);
     }
 }
 
@@ -57,62 +59,82 @@ internal static class KurrentRetry
             or RpcException { StatusCode: StatusCode.Internal, Status.DebugException: HttpProtocolException };
 
     /// <summary>
-    ///     Runs <paramref name="action"/>, retrying transient failures with exponential backoff until
-    ///     <see cref="KurrentRetryOptions.MaxAttempts"/> is reached. Stops as soon as <paramref name="cancellationToken"/>
-    ///     fires, so a requested cancellation surfaces unchanged.
+    ///     Runs <paramref name="action"/>, retrying transient failures with exponential backoff.
     ///     <para>
-    ///     <paramref name="callerToken"/> is the token the operation's caller supplied, if any. A caller that can cancel
-    ///     decides how long to wait; otherwise a retry must also fit within the policy's time budget, measured from
-    ///     <paramref name="startTimestamp"/> (a <see cref="Stopwatch"/> timestamp). It is separate from
-    ///     <paramref name="cancellationToken"/>, which can also carry the adapter's own disposal and so can always be cancelled.
+    ///     A caller that passes a cancellable <paramref name="callerToken"/> decides how long to wait: retries continue
+    ///     until it fires, and that surfaces as cancellation. Otherwise the operation is cancelled after the policy's
+    ///     timeout, which surfaces as a <see cref="TimeoutException"/> holding the last failure. It must not look like
+    ///     cancellation: nobody asked for it, and an attempt cut short leaves the outcome unknown.
+    ///     </para>
+    ///     <para>
+    ///     <paramref name="disposeToken"/> is the adapter's own disposal. It stops the operation but says nothing about
+    ///     the caller, so it has no bearing on the timeout.
     ///     </para>
     /// </summary>
-    public static async Task<T> ExecuteAsync<T>(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task<T>> action, long startTimestamp, CancellationToken cancellationToken, CancellationToken callerToken = default)
-    {
-        for (var attempt = 1; ; attempt++)
-        {
-            TimeSpan delay;
-            try
-            {
-                return await action(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ShouldRetry(policy, attempt, ex, Stopwatch.GetElapsedTime(startTimestamp), callerToken.CanBeCanceled, cancellationToken, out delay))
-            {
-                policy.Metrics.Retries.Add(1, new TagList
-                {
-                    { "Operation", operation },
-                    { "Exception", ex.GetType().Name },
-                });
-            }
+    public static Task<T> ExecuteAsync<T>(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task<T>> action, CancellationToken callerToken, CancellationToken disposeToken = default)
+        => ExecuteCoreAsync(policy, operation, action, streamingRead: false, callerToken, disposeToken);
 
-            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+    /// <summary>
+    ///     As <see cref="ExecuteAsync{T}"/>, for a read of a whole stream whose caller cannot cancel it. The client sets
+    ///     no deadline on those and a healthy one can outlast any timeout, so the timeout only stops it being retried,
+    ///     not an attempt in progress.
+    /// </summary>
+    public static Task<T> ExecuteStreamingReadAsync<T>(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task<T>> action, CancellationToken disposeToken)
+        => ExecuteCoreAsync(policy, operation, action, streamingRead: true, CancellationToken.None, disposeToken);
+
+    private static async Task<T> ExecuteCoreAsync<T>(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task<T>> action, bool streamingRead, CancellationToken callerToken, CancellationToken disposeToken)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(callerToken, disposeToken);
+        if (!callerToken.CanBeCanceled)
+        {
+            cancellation.CancelAfter(policy.Timeout);
+        }
+
+        var token = cancellation.Token;
+        var attemptToken = streamingRead ? disposeToken : token;
+        Exception? lastFailure = null;
+
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    return await action(attemptToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (IsTransient(ex) && !token.IsCancellationRequested)
+                {
+                    lastFailure = ex;
+                    policy.Metrics.Retries.Add(1, new TagList
+                    {
+                        { "Operation", operation },
+                        { "Exception", ex.GetType().Name },
+                    });
+                }
+
+                await Task.Delay(GetDelay(policy.Options, attempt), token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (token.IsCancellationRequested
+                                   && !callerToken.IsCancellationRequested
+                                   && !disposeToken.IsCancellationRequested
+                                   && (IsTransient(ex) || KurrentExceptionConverter.IsRequestedCancellation(ex, token)))
+        {
+            throw new TimeoutException($"{operation} did not complete within {policy.Timeout}.", IsTransient(ex) ? ex : lastFailure ?? ex);
         }
     }
 
-    public static Task ExecuteAsync(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task> action, long startTimestamp, CancellationToken cancellationToken, CancellationToken callerToken = default)
+    public static Task ExecuteAsync(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task> action, CancellationToken callerToken, CancellationToken disposeToken = default)
         => ExecuteAsync(policy, operation, async ct =>
         {
             await action(ct).ConfigureAwait(false);
             return true;
-        }, startTimestamp, cancellationToken, callerToken);
-
-    /// <summary>
-    ///     Whether to retry after <paramref name="exception"/> ended attempt <paramref name="attempt"/>, and if so after
-    ///     what <paramref name="delay"/>. Unless the caller can cancel, a retry must still finish within the time budget,
-    ///     even if it runs until the client's deadline.
-    /// </summary>
-    internal static bool ShouldRetry(KurrentRetryPolicy policy, int attempt, Exception exception, TimeSpan elapsed, bool callerCanCancel, CancellationToken cancellationToken, out TimeSpan delay)
-    {
-        delay = GetDelay(policy.Options, attempt);
-        return attempt < policy.Options.MaxAttempts
-               && !cancellationToken.IsCancellationRequested
-               && IsTransient(exception)
-               && (callerCanCancel || elapsed + delay + (policy.AttemptTimeout ?? TimeSpan.Zero) <= policy.MaxDuration);
-    }
+        }, callerToken, disposeToken);
 
     internal static TimeSpan GetDelay(KurrentRetryOptions options, int attempt)
     {
-        var exponential = Math.Min(options.BaseDelay.TotalMilliseconds * Math.Pow(2, attempt - 1), options.MaxDelay.TotalMilliseconds);
+        // Capped so that retrying indefinitely cannot overflow the doubling
+        var exponential = Math.Min(options.BaseDelay.TotalMilliseconds * Math.Pow(2, Math.Min(attempt - 1, 30)), options.MaxDelay.TotalMilliseconds);
 #pragma warning disable CA5394 // Random is fine for retry jitter
         var jitter = 0.5 + (Random.Shared.NextDouble() * 0.5);
 #pragma warning restore CA5394

@@ -17,6 +17,9 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
     // Throws for the next count calls that touch the stream, simulating a window such as a leader election
     internal void AddExceptionToThrowForTesting(string streamName, Exception exception, int count) => dictionaryExceptionToThrowOnceForTesting[streamName] = (exception, count);
 
+    // Ends a window started by AddExceptionToThrowForTesting
+    internal void ClearExceptionForTesting(string streamName) => dictionaryExceptionToThrowOnceForTesting.TryRemove(streamName, out _);
+
     internal void AddSetMetadataExceptionToThrowOnceForTesting(string streamName, Exception exception) => setMetadataExceptionToThrowOnce.AddOrUpdate(streamName, exception, (k, v) => v = exception);
 
     // Simulates the caller's token firing while the next call for the stream is in flight

@@ -20,61 +20,182 @@ public sealed class KurrentRetryTests
     private static readonly Exception Unavailable = new RpcException(new Status(StatusCode.Unavailable, ""));
 
     // No jitter worth speaking of: delays are 1-2ms
-    private static readonly KurrentRetryOptions Options = new() { MaxAttempts = 10, BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(2) };
+    private static readonly KurrentRetryOptions Options = new() { BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(2) };
+
+    private static KurrentRetryPolicy Policy(TimeSpan timeout) => new(Options, Metrics, timeout);
+
+    private static readonly TimeSpan ShortTimeout = TimeSpan.FromMilliseconds(50);
+
+    private static readonly TimeSpan LongTimeout = TimeSpan.FromMinutes(5);
+
+    [Fact]
+    public async Task WithoutACancellableTokenRetriesStopAtTheTimeout()
+    {
+        var attempts = 0;
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(ShortTimeout), "Test", _ =>
+        {
+            attempts++;
+            throw Unavailable;
+        }, CancellationToken.None));
+
+        Assert.True(attempts > 1);
+        Assert.Same(Unavailable, ex.InnerException);
+    }
+
+    [Fact]
+    public async Task WithoutACancellableTokenAnAttemptInFlightIsCancelledAtTheTimeout()
+    {
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(ShortTimeout), "Test", async token =>
+        {
+            await Task.Delay(Timeout.Infinite, token);
+            return true;
+        }, CancellationToken.None));
+
+        Assert.IsAssignableFrom<OperationCanceledException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task TheTimeoutAlsoCoversCancellationReportedByGrpc()
+    {
+        await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(ShortTimeout), "Test", async token =>
+        {
+            await token.WhenCanceled();
+            throw new RpcException(new Status(StatusCode.Cancelled, ""));
+        }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ACallerThatCanCancelKeepsRetryingPastTheTimeout()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var attempts = 0;
+
+        var result = await KurrentRetry.ExecuteAsync(Policy(ShortTimeout), "Test", async _ =>
+        {
+            if (++attempts == 1)
+            {
+                await Task.Delay(ShortTimeout * 3, TestContext.Current.CancellationToken);
+            }
+
+            return attempts > 3 ? true : throw Unavailable;
+        }, cancellation.Token);
+
+        Assert.True(result);
+        Assert.Equal(4, attempts);
+    }
+
+    [Fact]
+    public async Task ACallerThatCanCancelStopsRetriesWithCancellation()
+    {
+        using var cancellation = new CancellationTokenSource(ShortTimeout);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(LongTimeout), "Test", _ => throw Unavailable, cancellation.Token));
+    }
+
+    [Fact]
+    public async Task DisposalSurfacesAsCancellationNotTimeout()
+    {
+        using var dispose = new CancellationTokenSource(ShortTimeout);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(LongTimeout), "Test", _ => throw Unavailable, CancellationToken.None, dispose.Token));
+    }
+
+    [Fact]
+    public async Task DisposalDoesNotCountAsACallerThatCanCancel()
+    {
+        using var dispose = new CancellationTokenSource();
+
+        await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(ShortTimeout), "Test", _ => throw Unavailable, CancellationToken.None, dispose.Token));
+    }
+
+    [Fact]
+    public async Task AStreamingReadIsNotCancelledByTheTimeout()
+    {
+        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(ShortTimeout), "Test", async token =>
+        {
+            await Task.Delay(ShortTimeout * 3, token);
+            return true;
+        }, CancellationToken.None);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public async Task AStreamingReadIsNotRetriedAfterTheTimeout()
+    {
+        var attempts = 0;
+
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(ShortTimeout), "Test", async token =>
+        {
+            attempts++;
+            await Task.Delay(ShortTimeout * 3, token);
+            throw Unavailable;
+        }, CancellationToken.None));
+
+        Assert.Equal(1, attempts);
+        Assert.Same(Unavailable, ex.InnerException);
+    }
+
+    [Fact]
+    public async Task DisposalStopsAStreamingRead()
+    {
+        using var dispose = new CancellationTokenSource(ShortTimeout);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(LongTimeout), "Test", async token =>
+        {
+            await Task.Delay(Timeout.Infinite, token);
+            return true;
+        }, dispose.Token));
+    }
+
+    [Fact]
+    public async Task NonTransientFailuresAreNotRetried()
+    {
+        var attempts = 0;
+
+        await Assert.ThrowsAsync<RpcException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(LongTimeout), "Test", _ =>
+        {
+            attempts++;
+            throw new RpcException(new Status(StatusCode.PermissionDenied, ""));
+        }, CancellationToken.None));
+
+        Assert.Equal(1, attempts);
+    }
 
     [Theory]
-    [InlineData(0, true)]
-    [InlineData(19.9, true)] // 19.9s + ~2ms delay + 10s deadline still ends before 30s
-    [InlineData(20, false)] // a full 10s attempt would end after 30s
-    public void ARetryMustFinishWithinTheBudgetEvenIfItRunsToTheDeadline(double elapsedSeconds, bool expected)
-    {
-        var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(10));
-
-        Assert.Equal(expected, KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromSeconds(elapsedSeconds), callerCanCancel: false, CancellationToken.None, out _));
-    }
+    [InlineData(1)]
+    [InlineData(31)]
+    [InlineData(5000)]
+    public void TheDelayStaysWithinMaxDelayHoweverManyAttemptsThereHaveBeen(int attempt)
+        => Assert.InRange(KurrentRetry.GetDelay(Options, attempt), TimeSpan.Zero, Options.MaxDelay);
 
     [Fact]
-    public void WithoutAClientDeadlineOnlyTheDelayHasToFit()
-    {
-        var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), AttemptTimeout: null);
-
-        Assert.True(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromSeconds(29.9), callerCanCancel: false, CancellationToken.None, out _));
-        Assert.False(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromSeconds(30), callerCanCancel: false, CancellationToken.None, out _));
-    }
-
-    [Fact]
-    public void ACallerThatCanCancelIsNotHeldToTheBudget()
-    {
-        var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(10));
-
-        Assert.True(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.FromHours(1), callerCanCancel: true, CancellationToken.None, out _));
-    }
-
-    [Fact]
-    public void AttemptsCancellationAndNonTransientFailuresStillStopRetries()
-    {
-        var policy = new KurrentRetryPolicy(Options, Metrics, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(10));
-
-        Assert.False(KurrentRetry.ShouldRetry(policy, Options.MaxAttempts, Unavailable, TimeSpan.Zero, callerCanCancel: true, CancellationToken.None, out _));
-        Assert.False(KurrentRetry.ShouldRetry(policy, 1, Unavailable, TimeSpan.Zero, callerCanCancel: true, new CancellationToken(canceled: true), out _));
-        Assert.False(KurrentRetry.ShouldRetry(policy, 1, new RpcException(new Status(StatusCode.PermissionDenied, "")), TimeSpan.Zero, callerCanCancel: true, CancellationToken.None, out _));
-    }
-
-    [Fact]
-    public void PolicyDefaultsToTheOrleansResponseTimeoutAndTheClientDeadline()
+    public void PolicyTimesOutAfterTheOrleansResponseTimeout()
     {
         var services = new ServiceCollection().AddMetrics().AddSingleton<KurrentMetrics>();
         services.Configure<SiloMessagingOptions>(o => o.ResponseTimeout = TimeSpan.FromSeconds(12));
         using var serviceProvider = services.BuildServiceProvider();
 
-        var clientSettings = KurrentDBClientSettings.Create("esdb://localhost:2113?tls=false");
-        clientSettings.DefaultDeadline = TimeSpan.FromSeconds(4);
+        Assert.Equal(TimeSpan.FromSeconds(12), KurrentRetryPolicy.Create(serviceProvider, new KurrentStorageOptions()).Timeout);
+    }
 
-        var policy = KurrentRetryPolicy.Create(serviceProvider, new KurrentStorageOptions { ClientSettings = clientSettings });
-        Assert.Equal(TimeSpan.FromSeconds(12), policy.MaxDuration);
-        Assert.Equal(TimeSpan.FromSeconds(4), policy.AttemptTimeout);
+    [Fact]
+    public void AResponseTimeoutTooLongForATimerMeansNoTimeout()
+    {
+        var services = new ServiceCollection().AddMetrics().AddSingleton<KurrentMetrics>();
+        services.Configure<SiloMessagingOptions>(o => o.ResponseTimeout = TimeSpan.MaxValue);
+        using var serviceProvider = services.BuildServiceProvider();
 
-        var configured = KurrentRetryPolicy.Create(serviceProvider, new KurrentStorageOptions { ClientSettings = clientSettings, Retry = new KurrentRetryOptions { MaxDuration = TimeSpan.FromSeconds(7) } });
-        Assert.Equal(TimeSpan.FromSeconds(7), configured.MaxDuration);
+        Assert.Equal(Timeout.InfiniteTimeSpan, KurrentRetryPolicy.Create(serviceProvider, new KurrentStorageOptions()).Timeout);
+    }
+}
+
+internal static class CancellationTokenExtensions
+{
+    public static Task WhenCanceled(this CancellationToken token)
+    {
+        var completion = new TaskCompletionSource();
+        _ = token.Register(completion.SetResult);
+        return completion.Task;
     }
 }

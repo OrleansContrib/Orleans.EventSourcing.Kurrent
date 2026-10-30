@@ -441,18 +441,20 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
-        public async Task NotLeaderBeyondRetryBudgetSurfacesUntilResynchronized()
+        public async Task NotLeaderPastTheTimeoutSurfacesUntilResynchronized()
         {
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(FastRetry, TimeSpan.FromMilliseconds(100)));
 
             try
             {
                 Assert.True(await adapter.TryAppend(new Applied(1)));
 
-                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), FastRetry.MaxAttempts);
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), int.MaxValue);
 
                 var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
-                Assert.IsType<NotLeaderException>(ex.InnerException);
+                Assert.IsType<NotLeaderException>(Assert.IsType<TimeoutException>(ex.InnerException).InnerException);
+
+                client.ClearExceptionForTesting(streamName);
 
                 await adapter.Synchronize();
                 Assert.Equal(1, adapter.ConfirmedView.Balance);
@@ -490,64 +492,12 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
-        public async Task NoRetryIsStartedThatCouldOverrunTheBudget()
-        {
-            // Another attempt could take the full 10s client deadline, which does not fit in a 5s budget
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(FastRetry, maxDuration: TimeSpan.FromSeconds(5), attemptTimeout: TimeSpan.FromSeconds(10)));
-
-            try
-            {
-                Assert.True(await adapter.TryAppend(new Applied(1)));
-
-                // A retry would succeed, so the failure only surfaces if the append is not retried
-                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
-
-                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
-                Assert.Equal(StatusCode.Unavailable, Assert.IsType<RpcException>(ex.InnerException).StatusCode);
-            }
-            finally
-            {
-                adapter.Dispose();
-            }
-        }
-
-        [Fact]
-        public async Task ACancellableCallerTokenTakesThePlaceOfTheBudget()
-        {
-            // No retry fits in this budget, so a retry can only happen if the budget does not apply
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(FastRetry, maxDuration: TimeSpan.FromSeconds(5), attemptTimeout: TimeSpan.FromSeconds(10)));
-
-            try
-            {
-                Assert.True(await adapter.TryAppend(new Applied(1)));
-
-                // The adapter's own linked token can always be cancelled, but the caller's cannot
-                client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
-                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(CancellationToken.None));
-                Assert.IsType<NotLeaderException>(ex.InnerException);
-
-                using var cancellation = new CancellationTokenSource();
-                client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
-                await adapter.ClearLogAsync(cancellation.Token);
-                Assert.Equal(0, adapter.ConfirmedVersion);
-            }
-            finally
-            {
-                adapter.Dispose();
-            }
-        }
-
-        [Fact]
-        public async Task AQueuedWritesBudgetCountsTimeSpentWaitingBehindEarlierWrites()
+        public async Task AWriteCutShortByTheTimeoutFailsRatherThanLookingLikeDisposal()
         {
             var streamNameProvider = new KurrentStreamName();
             var services = new TestLogConsistencyProtocolServices();
-            var streamName = streamNameProvider.GetStreamName(services.GrainId);
             var blocking = new BlockingKurrentClient(new InMemoryKurrentClient());
-            var client = new ExceptionalKurrentClientWrapper(blocking);
-
-            // Budget 250ms with no client deadline: a retry fits if the write started less than ~250ms ago
-            var adapter = CreateAdapter(client, services, streamNameProvider, retry: Policy(FastRetry, maxDuration: TimeSpan.FromMilliseconds(250), attemptTimeout: TimeSpan.Zero));
+            var adapter = CreateAdapter(blocking, services, streamNameProvider, retry: Policy(FastRetry, TimeSpan.FromMilliseconds(100)));
 
             try
             {
@@ -555,17 +505,67 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 adapter.Submit(new Applied(1));
                 await blocking.WaitForAppendToStart();
 
-                // Queued behind the blocked write; its first attempt fails once it gets to run
-                adapter.Submit(new Applied(10));
-                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
-
-                await Task.Delay(400, TestContext.Current.CancellationToken);
-                blocking.ReleaseAppend();
-
-                // Measured from submission, the second write is already over budget, so it is not retried
                 var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ConfirmSubmittedEntries());
-                Assert.Equal(StatusCode.Unavailable, Assert.IsType<RpcException>(ex.InnerException).StatusCode);
-                Assert.Equal(1, adapter.ConfirmedVersion);
+                Assert.IsType<TimeoutException>(ex.InnerException);
+
+                // The outcome is unknown, so later writes must not assume where the stream is
+                await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
+
+                await adapter.Synchronize();
+                Assert.True(await adapter.TryAppend(new Applied(10)));
+                Assert.Equal(10, adapter.ConfirmedView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ALoadThatOutlastsTheTimeoutIsNotCutShort()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var client = new BlockingKurrentClient(new InMemoryKurrentClient());
+            var adapter = CreateAdapter(client, services, streamNameProvider, retry: Policy(FastRetry, TimeSpan.FromMilliseconds(100)));
+
+            try
+            {
+                Assert.True(await adapter.TryAppendRange([new Applied(1), new Applied(2)]));
+
+                client.ReadDelay = TimeSpan.FromMilliseconds(300);
+                await adapter.Synchronize();
+                Assert.Equal(3, adapter.ConfirmedView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task ACancellableCallerTokenTakesThePlaceOfTheTimeout()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(FastRetry, TimeSpan.FromMilliseconds(100)));
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+
+                // The adapter's disposal token can always be cancelled, but the caller's cannot
+                client.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), int.MaxValue);
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(CancellationToken.None));
+                Assert.IsType<TimeoutException>(ex.InnerException);
+
+                using var cancellation = new CancellationTokenSource();
+                var clear = adapter.ClearLogAsync(cancellation.Token);
+
+                await Task.Delay(300, TestContext.Current.CancellationToken);
+                Assert.False(clear.IsCompleted);
+
+                client.ClearExceptionForTesting(streamName);
+                await clear;
+                Assert.Equal(0, adapter.ConfirmedVersion);
             }
             finally
             {
@@ -576,7 +576,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         [Fact]
         public async Task DisposeStopsRetryingPromptly()
         {
-            var slowRetry = new KurrentRetryOptions { MaxAttempts = 100, BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
+            var slowRetry = new KurrentRetryOptions { BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
             var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(slowRetry));
 
             Assert.True(await adapter.TryAppend(new Applied(1)));
@@ -592,7 +592,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         [Fact]
         public async Task DisposeStopsRetrieveLogSegmentRetryingPromptly()
         {
-            var slowRetry = new KurrentRetryOptions { MaxAttempts = 100, BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
+            var slowRetry = new KurrentRetryOptions { BaseDelay = TimeSpan.FromSeconds(10), MaxDelay = TimeSpan.FromSeconds(10) };
             var (adapter, client, streamName) = CreateLeaderChangeAdapter(Policy(slowRetry));
 
             Assert.True(await adapter.TryAppend(new Applied(1)));
@@ -662,11 +662,11 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             { new TimeoutException(), false },
         };
 
-        private static readonly KurrentRetryOptions FastRetry = new() { MaxAttempts = 5, BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(5) };
+        private static readonly KurrentRetryOptions FastRetry = new() { BaseDelay = TimeSpan.FromMilliseconds(1), MaxDelay = TimeSpan.FromMilliseconds(5) };
 
-        // A 30s budget (the Orleans response timeout) and a 10s client deadline, as with the defaults
-        private static KurrentRetryPolicy Policy(KurrentRetryOptions options, TimeSpan? maxDuration = null, TimeSpan? attemptTimeout = null)
-            => new(options, Metrics, maxDuration ?? TimeSpan.FromSeconds(30), attemptTimeout ?? TimeSpan.FromSeconds(10));
+        // A 30s timeout, the Orleans default response timeout
+        private static KurrentRetryPolicy Policy(KurrentRetryOptions options, TimeSpan? timeout = null)
+            => new(options, Metrics, timeout ?? TimeSpan.FromSeconds(30));
 
         private static (KurrentLogViewAdapter<TestView, TestLogEntry> Adapter, ExceptionalKurrentClientWrapper Client, string StreamName) CreateLeaderChangeAdapter(KurrentRetryPolicy? retry = null)
         {
@@ -758,6 +758,8 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             private TaskCompletionSource releaseAppend = CreateSignal();
             private volatile bool blockNextAppend;
 
+            public TimeSpan ReadDelay { get; set; }
+
             public void BlockNextAppend()
             {
                 appendStarted = CreateSignal();
@@ -793,8 +795,11 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             public Task<StreamMetadataResult> GetStreamMetadata(string streamName, CancellationToken token)
                 => inner.GetStreamMetadata(streamName, token);
 
-            public ValueTask<IStreamReadResult> ReadStreamAsync(Direction direction, string streamName, StreamPosition position, long maxCount, bool resolveLinkTos, CancellationToken cancellationToken)
-                => inner.ReadStreamAsync(direction, streamName, position, maxCount, resolveLinkTos, cancellationToken);
+            public async ValueTask<IStreamReadResult> ReadStreamAsync(Direction direction, string streamName, StreamPosition position, long maxCount, bool resolveLinkTos, CancellationToken cancellationToken)
+            {
+                await Task.Delay(ReadDelay, cancellationToken);
+                return await inner.ReadStreamAsync(direction, streamName, position, maxCount, resolveLinkTos, cancellationToken);
+            }
 
             public Task<IWriteResult> SetStreamMetadata(string streamName, StreamState expectedRevision, StreamMetadata streamMetadata, CancellationToken token)
                 => inner.SetStreamMetadata(streamName, expectedRevision, streamMetadata, token);

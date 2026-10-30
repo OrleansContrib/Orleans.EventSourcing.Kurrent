@@ -261,13 +261,13 @@ public sealed class BasicTests : IAsyncLifetime
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
-    public async Task GrainStorage_TimeBudgetOnlyAppliesWithoutACancellableToken()
+    public async Task GrainStorage_TimeoutOnlyAppliesWithoutACancellableToken()
     {
         var serviceProvider = cluster.GetSiloServiceProvider();
         var metrics = serviceProvider.GetRequiredService<KurrentMetrics>();
 
-        // A retry could take the 10s client deadline, which never fits in a 1s budget
-        var retry = new KurrentRetryPolicy(new Configuration.KurrentRetryOptions(), metrics, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10));
+        // Already expired when the first attempt fails, so a retry can only happen if the timeout does not apply
+        var retry = new KurrentRetryPolicy(new Configuration.KurrentRetryOptions(), metrics, TimeSpan.Zero);
         var storage = new KurrentGrainStorageProvider(kurrentClient,
                                                       serviceProvider.GetRequiredKeyedService<IEventConverterFactory>(ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME),
                                                       streamNameProvider,
@@ -280,7 +280,7 @@ public sealed class BasicTests : IAsyncLifetime
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
         var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => storage.WriteStateAsync("test", grainId, state, CancellationToken.None));
-        Assert.IsType<NotLeaderException>(ex.InnerException);
+        Assert.IsType<NotLeaderException>(Assert.IsType<TimeoutException>(ex.InnerException).InnerException);
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
         using var cancellation = new CancellationTokenSource();
