@@ -111,6 +111,11 @@ internal static class KurrentRetry
                         { "Exception", ex.GetType().Name },
                     });
                 }
+                catch (Exception ex) when (IsTransient(ex) && (callerToken.IsCancellationRequested || disposeToken.IsCancellationRequested))
+                {
+                    // Cancellation landed as the attempt failed: report the cancellation that was asked for, not the failure
+                    throw new OperationCanceledException($"{operation} was cancelled.", ex, token);
+                }
 
                 await Task.Delay(GetDelay(policy.Options, attempt), token).ConfigureAwait(false);
             }

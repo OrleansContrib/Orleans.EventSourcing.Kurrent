@@ -32,7 +32,7 @@ public sealed class KurrentRetryTests
     public async Task WithoutACancellableTokenRetriesStopAtTheTimeout()
     {
         var attempts = 0;
-        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(ShortTimeout), "Test", _ =>
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteAsync<bool>(Policy(TimeSpan.FromMilliseconds(250)), "Test", _ =>
         {
             attempts++;
             throw Unavailable;
@@ -125,7 +125,8 @@ public sealed class KurrentRetryTests
     {
         var attempts = 0;
 
-        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(ShortTimeout), "Test", async token =>
+        // A zero timeout is due before the attempt even starts, so its timer cannot fire after the attempt's own delay
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(TimeSpan.Zero), "Test", async token =>
         {
             attempts++;
             await Task.Delay(ShortTimeout * 3, token);

@@ -266,7 +266,7 @@ public sealed class BasicTests : IAsyncLifetime
         var serviceProvider = cluster.GetSiloServiceProvider();
         var metrics = serviceProvider.GetRequiredService<KurrentMetrics>();
 
-        // Already expired when the first attempt fails, so a retry can only happen if the timeout does not apply
+        // Expires almost at once, so only a caller whose token can be cancelled keeps retrying
         var retry = new KurrentRetryPolicy(new Configuration.KurrentRetryOptions(), metrics, TimeSpan.Zero);
         var storage = new KurrentGrainStorageProvider(kurrentClient,
                                                       serviceProvider.GetRequiredKeyedService<IEventConverterFactory>(ProviderConstants.DEFAULT_STORAGE_PROVIDER_NAME),
@@ -278,9 +278,11 @@ public sealed class BasicTests : IAsyncLifetime
         var streamName = streamNameProvider.GetStreamName("test", grainId);
         var state = new GrainState<GrainState>(new GrainState { Value = 1 });
 
-        kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+        // Fails until the timeout, however late its timer fires
+        kurrentClient.AddExceptionToThrowForTesting(streamName, new NotLeaderException("localhost", 2313), int.MaxValue);
         var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => storage.WriteStateAsync("test", grainId, state, CancellationToken.None));
         Assert.IsType<NotLeaderException>(Assert.IsType<TimeoutException>(ex.InnerException).InnerException);
+        kurrentClient.ClearExceptionForTesting(streamName);
 
         kurrentClient.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
         using var cancellation = new CancellationTokenSource();
