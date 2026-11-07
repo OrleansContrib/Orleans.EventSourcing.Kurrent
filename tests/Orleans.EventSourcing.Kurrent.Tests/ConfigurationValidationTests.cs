@@ -83,6 +83,29 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             Assert.Contains(nameof(KurrentClusteringOptions.StreamPrefix), exception.Message);
         }
 
+        [Theory]
+        [InlineData(0, true)]
+        [InlineData(-1, false)]
+        public void SnapshotEveryWriteIsAllowedButNegativeCountsAreNot(int eventCountBeforeSnapshot, bool valid)
+        {
+            var services = ServicesWithOrleansValidator();
+            services.AddKurrentBasedMembershipTable(o => o.Configure(x =>
+            {
+                x.ClientSettings = ClientSettings;
+                x.EventCountBeforeSnapshot = eventCountBeforeSnapshot;
+            }));
+
+            if (valid)
+            {
+                Validate(services);
+            }
+            else
+            {
+                var exception = Assert.Throws<OrleansConfigurationException>(() => Validate(services));
+                Assert.Contains("must not be negative", exception.Message);
+            }
+        }
+
         private static void Valid(KurrentStorageOptions options)
         {
             options.ClientSettings = ClientSettings;
