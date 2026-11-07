@@ -74,7 +74,7 @@ internal static class ServiceCollectionExtensions
         configureOptions?.Invoke(services.AddOptions<KurrentStorageOptions>(name));
 
         // Configure log storage.
-        services.TryAddTransient<IConfigurationValidator>(sp => new KurrentStorageOptionsValidator(sp.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name), name));
+        services.AddTransient<IConfigurationValidator>(sp => new KurrentStorageOptionsValidator(sp.GetRequiredService<IOptionsMonitor<KurrentStorageOptions>>().Get(name), name));
         services.TryAddTransient<IPostConfigureOptions<KurrentStorageOptions>, DefaultStorageProviderSerializerOptionsConfigurator<KurrentStorageOptions>>();
         services.ConfigureNamedOptionForLogging<KurrentStorageOptions>(name);
 
@@ -89,7 +89,7 @@ internal static class ServiceCollectionExtensions
     internal static void AddKurrentBasedMembershipTable(this IServiceCollection services, Action<OptionsBuilder<KurrentClusteringOptions>>? configureOptions = null)
     {
         configureOptions?.Invoke(services.AddOptions<KurrentClusteringOptions>());
-        services.TryAddTransient<IConfigurationValidator>(sp => new KurrentClusteringOptionsValidator(sp.GetRequiredService<IOptions<KurrentClusteringOptions>>().Value));
+        services.AddTransient<IConfigurationValidator>(sp => new KurrentClusteringOptionsValidator(sp.GetRequiredService<IOptions<KurrentClusteringOptions>>().Value));
         services.TryAddSingleton(KurrentClientFactory.Create);
         services.TryAddSingleton(KurrentMembershipEventStorageFactory.Create);
         services.TryAddSingleton<IMembershipTable, KurrentMembershipTable>();
