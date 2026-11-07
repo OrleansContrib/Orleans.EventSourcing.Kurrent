@@ -396,6 +396,29 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
+        public async Task ClearLogStillFailsWhenTheStreamWasDeletedAfterAnAttemptThatNeverReachedTheServer()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                // Deleted by someone else; this adapter's first attempt fails with NotLeader, which is raised before
+                // the request reaches the server, so the retry's StreamDeletedException is not a lost reply
+                await client.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken);
+                client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
+
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(TestContext.Current.CancellationToken));
+                Assert.IsType<StreamDeletedException>(ex.InnerException);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
         public async Task NotLeaderOnLoadIsRetried()
         {
             var (adapter, client, streamName) = CreateLeaderChangeAdapter();
@@ -652,10 +675,15 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             { new NotLeaderException("localhost", 2313), true },
             { new DiscoveryException(10), true },
             { new RpcException(new Status(StatusCode.Unavailable, "unavailable")), true },
-            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0, "The HTTP/2 server closed the connection.", null))), true },
-            // A call that fails while starting because the node stopped answering keepalive pings
-            { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", new HttpProtocolException(0, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", null)))), true },
+            // The server closed (NO_ERROR) or aborted (INTERNAL_ERROR) the connection mid-call, e.g. as it shut down
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0x0, "The HTTP/2 server closed the connection.", null))), true },
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0x2, "The HTTP/2 server closed the connection.", null))), true },
+            // A call that fails while starting because the node stopped answering keepalive pings (.NET reports PROTOCOL_ERROR)
+            { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", new HttpProtocolException(0x1, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", null)))), true },
             { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException("Some other failure."))), false },
+            // HTTP_1_1_REQUIRED and ENHANCE_YOUR_CALM won't clear on a retry, whether reported directly or wrapped
+            { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "HTTP/1.1 required.", new HttpProtocolException(0xd, "HTTP/1.1 required.", null)))), false },
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0xb, "Enhance your calm.", null))), false },
             { new RpcException(new Status(StatusCode.Internal, "internal")), false },
             { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
             { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },

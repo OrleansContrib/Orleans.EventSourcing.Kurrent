@@ -375,24 +375,26 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
     /// <summary>
     /// Tombstones the stream, retrying across a leader change. Unlike a soft delete, resending a
-    /// tombstone that already landed fails with <see cref="StreamDeletedException"/>, so on a retry
-    /// that means an earlier attempt whose reply was lost succeeded.
+    /// tombstone that already landed fails with <see cref="StreamDeletedException"/>, so after an
+    /// earlier attempt that may have landed, that means its reply was lost and it succeeded. If no
+    /// earlier attempt reached the server, someone else deleted the stream and it still fails.
     /// </summary>
     private static Task TombstoneAsync(CommandContext context, int expectedVersion, CancellationToken cancellationToken, CancellationToken disposeToken)
     {
-        var retrying = false;
+        var earlierAttemptMayHaveLanded = false;
         return KurrentRetry.ExecuteAsync(context.Retry, "Tombstone", async token =>
         {
             try
             {
                 _ = await context.Client.TombstoneStreamAsync(context.StreamName, expectedVersion.ToStreamState(), token).ConfigureAwait(false);
             }
-            catch (StreamDeletedException) when (retrying)
+            catch (StreamDeletedException) when (earlierAttemptMayHaveLanded)
             {
             }
-            finally
+            catch (Exception ex) when (KurrentRetry.MayHaveLanded(ex))
             {
-                retrying = true;
+                earlierAttemptMayHaveLanded = true;
+                throw;
             }
         }, cancellationToken, disposeToken);
     }

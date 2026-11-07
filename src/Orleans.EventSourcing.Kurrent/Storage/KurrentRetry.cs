@@ -58,17 +58,31 @@ internal static class KurrentRetry
            || (exception is RpcException { StatusCode: StatusCode.Internal, Status.DebugException: { } debug } && IsBrokenConnection(debug));
 
     /// <summary>
-    ///     True when the HTTP/2 connection failed: the server closed it, or stopped answering keepalive pings. A call
-    ///     that fails mid-call reports the <see cref="HttpProtocolException"/> directly. A call that fails while starting
-    ///     reports an <see cref="HttpRequestException"/> wrapping it.
+    ///     True for a transient failure whose request may have reached the server, so a write it carried may have
+    ///     landed. <see cref="NotLeaderException"/> and <see cref="DiscoveryException"/> are raised before that.
+    /// </summary>
+    public static bool MayHaveLanded(Exception exception)
+        => IsTransient(exception) && exception is not (NotLeaderException or DiscoveryException);
+
+    // HTTP/2 error codes (RFC 9113 section 7) that mean the connection was lost rather than misused
+    private const long Http2NoError = 0x0;       // The server closed the connection (GOAWAY), e.g. as it shut down
+    private const long Http2ProtocolError = 0x1; // .NET's code for a keepalive ping that went unanswered
+    private const long Http2InternalError = 0x2; // The server aborted the connection, e.g. as it shut down
+
+    /// <summary>
+    ///     True when the HTTP/2 connection was lost: the server closed or aborted it, or stopped answering keepalive
+    ///     pings. A call that fails mid-call reports the <see cref="HttpProtocolException"/> directly. A call that fails
+    ///     while starting reports an <see cref="HttpRequestException"/> wrapping it. Other error codes, such as
+    ///     HTTP_1_1_REQUIRED from an endpoint that doesn't support HTTP/2, won't clear on a retry. A PROTOCOL_ERROR from
+    ///     a healthy server can't be told apart from a keepalive timeout, so it is retried until the timeout.
     /// </summary>
     private static bool IsBrokenConnection(Exception debug)
     {
         for (var current = debug; current is not null; current = current.InnerException)
         {
-            if (current is HttpProtocolException)
+            if (current is HttpProtocolException protocolException)
             {
-                return true;
+                return protocolException.ErrorCode is Http2NoError or Http2ProtocolError or Http2InternalError;
             }
         }
 
