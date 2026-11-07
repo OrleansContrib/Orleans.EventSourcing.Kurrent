@@ -54,9 +54,26 @@ internal static class KurrentRetry
     ///     not retried: the client does not reconnect after it, so a retry would hang on the same dead connection.
     /// </summary>
     public static bool IsTransient(Exception exception)
-        => exception is NotLeaderException or DiscoveryException
-            or RpcException { StatusCode: StatusCode.Unavailable }
-            or RpcException { StatusCode: StatusCode.Internal, Status.DebugException: HttpProtocolException };
+        => exception is NotLeaderException or DiscoveryException or RpcException { StatusCode: StatusCode.Unavailable }
+           || (exception is RpcException { StatusCode: StatusCode.Internal, Status.DebugException: { } debug } && IsBrokenConnection(debug));
+
+    /// <summary>
+    ///     True when the HTTP/2 connection failed: the server closed it, or stopped answering keepalive pings. A call
+    ///     that fails mid-call reports the <see cref="HttpProtocolException"/> directly. A call that fails while starting
+    ///     reports an <see cref="HttpRequestException"/> wrapping it.
+    /// </summary>
+    private static bool IsBrokenConnection(Exception debug)
+    {
+        for (var current = debug; current is not null; current = current.InnerException)
+        {
+            if (current is HttpProtocolException)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>
     ///     Runs <paramref name="action"/>, retrying transient failures with exponential backoff.

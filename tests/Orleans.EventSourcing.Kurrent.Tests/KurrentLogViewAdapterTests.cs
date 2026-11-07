@@ -653,6 +653,9 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             { new DiscoveryException(10), true },
             { new RpcException(new Status(StatusCode.Unavailable, "unavailable")), true },
             { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0, "The HTTP/2 server closed the connection.", null))), true },
+            // A call that fails while starting because the node stopped answering keepalive pings
+            { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", new HttpProtocolException(0, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", null)))), true },
+            { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException("Some other failure."))), false },
             { new RpcException(new Status(StatusCode.Internal, "internal")), false },
             { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
             { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },
