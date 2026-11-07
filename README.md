@@ -270,7 +270,7 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 
 ### Riding out a leader change
 
-When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. Both storage providers (and so the reminders provider, which is built on the log-consistency provider) retry those requests, so a leader change shows up as extra latency rather than failed grain calls. They retry `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures and calls cut off by the old leader closing its connection, with exponential backoff and jitter. Other failures, and cancellation, are not retried.
+When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. Both storage providers (and so the reminders provider, which is built on the log-consistency provider) retry those requests, so a leader change shows up as extra latency rather than failed grain calls. They retry `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures, and calls whose HTTP/2 connection was lost: closed or aborted by the old leader as it shut down, or declared dead because the node stopped answering keepalive pings. Retries use exponential backoff and jitter. Other failures, and cancellation, are not retried.
 
 That includes `DeadlineExceeded`, which is how calls in flight to a leader that died without closing its connections end. The client does not reconnect after it, so a retry would hang on the same dead connection, and those calls fail when the client's `DefaultDeadline` expires.
 
@@ -289,9 +289,18 @@ How long an operation may run depends on whether its caller can cancel it:
 
 Reading a whole stream (a `JournaledGrain` load or `RetrieveLogSegment`) is the exception to the timeout. The client sets no deadline on those and a long stream can legitimately take longer than any timeout, so the timeout only stops a failed read being retried, not a read in progress.
 
-Each attempt is separately limited by the client: `DefaultDeadline` (10s by default) applies to everything except streaming reads, and gRPC keepalive detects a dead connection after about 20 seconds.
+Each attempt is separately limited by the client: `DefaultDeadline` (10s by default) applies to everything except streaming reads, and gRPC keepalive (`keepAliveInterval` and `keepAliveTimeout` in the connection string, 10s each by default) usually detects a dead connection after about 20 seconds. See the limits below for when it doesn't.
 
-Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again, and a tombstone that already landed is treated as done. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
+Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again. A tombstone that already landed is treated as done if an earlier attempt could have reached the server; if none could, the stream was deleted by someone else and the clear still fails. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
+
+#### Limits: a frozen or partitioned leader
+
+A leader that is stopped or killed closes its connections, or its restart makes the client reconnect. A leader that freezes, or that the network cuts off, does neither: it stops answering without closing anything, and the followers elect a new leader within seconds.
+
+- **KurrentDB.Client 1.2.0 doesn't fail over in that case.** It only looks for a new leader after `NotLeaderException` or `Unavailable`, but a dead connection fails with gRPC `Internal` (the keepalive timeout). The client keeps reconnecting to the frozen node, and writes stop until that node comes back. A client fix is proposed in [kurrent-io/KurrentDB-Client-Dotnet#434](https://github.com/kurrent-io/KurrentDB-Client-Dotnet/pull/434).
+- **On .NET 8 and 10, keepalive doesn't run on a full HTTP/2 connection.** .NET only checks connections that have room for another call, so a connection already at the server's limit on concurrent calls when the leader froze is never pinged. Calls on it hang until something cancels them: a JournaledGrain load until Orleans' activation timeout, other calls until their own timeout. This is [dotnet/runtime#120179](https://github.com/dotnet/runtime/issues/120179), fixed for .NET 11.
+
+With the client fix, load tests with the leader frozen for 90s saw writes stop for 20 to 45 seconds, though no acknowledged write was lost.
 
 ### Custom event stream naming
 
