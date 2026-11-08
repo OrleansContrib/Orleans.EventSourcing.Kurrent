@@ -179,7 +179,7 @@ public sealed class AccountGrain : JournaledGrain<AccountState, AccountEvent>, I
 
 ### Deleting the event stream
 
-The log-consistency provider [tombstones](https://docs.kurrent.io/clients/python/v1.2/delete-stream.html#tombstone-stream) the event stream using `JournaledGrain.ClearLogAsync`.
+The log-consistency provider [tombstones](https://docs.kurrent.io/clients/python/v1.2/delete-stream.html#tombstone-stream) the event stream using `JournaledGrain.ClearLogAsync`. If the stream is already tombstoned, for example by another activation, `ClearLogAsync` still succeeds: the stream ends up deleted either way.
 
 > **Note:** Once tombstoned a stream cannot be reused in Kurrent. To truncate the stream use the `DiscardPriorEvents` attribute instead.
 
@@ -291,7 +291,7 @@ Reading a whole stream (a `JournaledGrain` load or `RetrieveLogSegment`) is the 
 
 Each attempt is separately limited by the client: `DefaultDeadline` (10s by default) applies to everything except streaming reads, and gRPC keepalive (`keepAliveInterval` and `keepAliveTimeout` in the connection string, 10s each by default) usually detects a dead connection after about 20 seconds. See the limits below for when it doesn't.
 
-Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again. A tombstone that already landed is treated as done if an earlier attempt could have reached the server; if none could, the stream was deleted by someone else and the clear still fails. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
+Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. Resending a soft delete that already landed succeeds again. Resending a tombstone that already landed finds the stream deleted, which counts as done. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
 
 #### Limits: a frozen or partitioned leader
 

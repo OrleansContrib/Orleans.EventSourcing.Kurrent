@@ -375,7 +375,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
-        public async Task ClearLogStillFailsWhenTheStreamWasAlreadyDeleted()
+        public async Task ClearLogSucceedsWhenSomeoneElseAlreadyDeletedTheStream()
         {
             var (adapter, client, streamName) = CreateLeaderChangeAdapter();
 
@@ -383,11 +383,13 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             {
                 Assert.True(await adapter.TryAppend(new Applied(100)));
 
-                // Deleted by someone else before this adapter's first attempt, so it is not a lost reply
+                // Deleted by someone else before this adapter's first attempt; the stream ends up deleted either way
                 await client.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken);
 
-                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(TestContext.Current.CancellationToken));
-                Assert.IsType<StreamDeletedException>(ex.InnerException);
+                await adapter.ClearLogAsync(TestContext.Current.CancellationToken);
+
+                Assert.Equal(0, adapter.ConfirmedVersion);
+                Assert.Equal(0, adapter.ConfirmedView.Balance);
             }
             finally
             {
@@ -396,7 +398,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
-        public async Task ClearLogStillFailsWhenTheStreamWasDeletedAfterAnAttemptThatNeverReachedTheServer()
+        public async Task ClearLogSucceedsWhenSomeoneElseDeletedTheStreamDuringALeaderChange()
         {
             var (adapter, client, streamName) = CreateLeaderChangeAdapter();
 
@@ -404,13 +406,14 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             {
                 Assert.True(await adapter.TryAppend(new Applied(100)));
 
-                // Deleted by someone else; this adapter's first attempt fails with NotLeader, which is raised before
-                // the request reaches the server, so the retry's StreamDeletedException is not a lost reply
+                // This adapter's first attempt fails with NotLeader, and its retry finds the stream deleted by someone else
                 await client.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken);
                 client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
 
-                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(TestContext.Current.CancellationToken));
-                Assert.IsType<StreamDeletedException>(ex.InnerException);
+                await adapter.ClearLogAsync(TestContext.Current.CancellationToken);
+
+                Assert.Equal(0, adapter.ConfirmedVersion);
+                Assert.Equal(0, adapter.ConfirmedView.Balance);
             }
             finally
             {

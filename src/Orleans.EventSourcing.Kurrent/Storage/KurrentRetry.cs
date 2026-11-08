@@ -57,13 +57,6 @@ internal static class KurrentRetry
         => exception is NotLeaderException or DiscoveryException or RpcException { StatusCode: StatusCode.Unavailable }
            || (exception is RpcException { StatusCode: StatusCode.Internal, Status.DebugException: { } debug } && IsBrokenConnection(debug));
 
-    /// <summary>
-    ///     True for a transient failure whose request may have reached the server, so a write it carried may have
-    ///     landed. <see cref="NotLeaderException"/> and <see cref="DiscoveryException"/> are raised before that.
-    /// </summary>
-    public static bool MayHaveLanded(Exception exception)
-        => IsTransient(exception) && exception is not (NotLeaderException or DiscoveryException);
-
     // HTTP/2 error codes (RFC 9113 section 7) that mean the connection was lost rather than misused
     private const long Http2NoError = 0x0;       // The server closed the connection (GOAWAY), e.g. as it shut down
     private const long Http2ProtocolError = 0x1; // .NET's code for a keepalive ping that went unanswered
