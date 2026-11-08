@@ -29,7 +29,7 @@ internal sealed record KurrentRetryPolicy(KurrentRetryOptions Options, KurrentMe
     /// <summary>
     ///     The longest delay <see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/> accepts.
     /// </summary>
-    private static readonly TimeSpan MaxTimeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+    internal static readonly TimeSpan MaxTimeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
 
     public static KurrentRetryPolicy Create(IServiceProvider serviceProvider, KurrentStorageOptions options)
     {
@@ -46,11 +46,12 @@ internal sealed record KurrentRetryPolicy(KurrentRetryOptions Options, KurrentMe
 internal static class KurrentRetry
 {
     /// <summary>
-    ///     True for failures that clear once the client has found the new leader. <see cref="NotLeaderException"/>
-    ///     and <see cref="DiscoveryException"/> are raised before the request is accepted. An
-    ///     <see cref="StatusCode.Unavailable"/> failure, or the old leader closing its HTTP/2 connection mid-call as it
-    ///     shuts down, leaves the outcome unknown; that is safe because an append is only retried with the same event
-    ///     IDs and expected version, which Kurrent treats as idempotent. <see cref="StatusCode.DeadlineExceeded"/> is
+    ///     True for failures that clear once the client has found the new leader or reconnected.
+    ///     <see cref="NotLeaderException"/> and <see cref="DiscoveryException"/> are raised before the request is
+    ///     accepted. An <see cref="StatusCode.Unavailable"/> failure, or a lost HTTP/2 connection (closed or aborted by
+    ///     the server, or a keepalive ping that went unanswered, mid-call or while the call was starting; see
+    ///     <see cref="IsBrokenConnection"/>), leaves the outcome unknown; that is safe because an append is only retried
+    ///     with the same event IDs and expected version, which Kurrent treats as idempotent. <see cref="StatusCode.DeadlineExceeded"/> is
     ///     not retried: the client does not reconnect after it, so a retry would hang on the same dead connection.
     /// </summary>
     public static bool IsTransient(Exception exception)

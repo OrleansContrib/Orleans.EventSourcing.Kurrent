@@ -351,7 +351,9 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     /// <summary>
     /// Runs a stream tombstone as a chain link, keeping it FIFO with any writes submitted by
     /// interleaved grain calls. Uses the grain-observed confirmed version as the expected stream
-    /// state, mirroring the optimistic-concurrency approach used by appends. If there are no
+    /// state, so a clear fails if someone else appended since the grain last saw the stream. Unlike
+    /// an append it succeeds if someone else already tombstoned the stream, at whatever version:
+    /// see <see cref="TombstoneAsync"/>. If there are no
     /// confirmed entries there is nothing to delete (the stream may not exist), matching
     /// KurrentGrainStorageProvider.ClearStateAsync which skips when the ETag is empty.
     /// See https://github.com/kurrent-io/KurrentDB/issues/4637

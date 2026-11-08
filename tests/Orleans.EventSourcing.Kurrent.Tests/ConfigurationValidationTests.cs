@@ -40,6 +40,21 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
+        public void RetryDelaysLongerThanTaskDelayAcceptsAreRejected()
+        {
+            var services = ServicesWithOrleansValidator();
+            services.AddKurrentBasedLogConsistencyProvider("events", o => o.Configure(x =>
+            {
+                Valid(x);
+                x.Retry.BaseDelay = TimeSpan.FromDays(60);
+                x.Retry.MaxDelay = TimeSpan.FromDays(100);
+            }));
+
+            var exception = Assert.Throws<OrleansConfigurationException>(() => Validate(services));
+            Assert.Contains(nameof(KurrentRetryOptions.MaxDelay), exception.Message);
+        }
+
+        [Fact]
         public void GrainStorageProviderIsValidated()
         {
             var services = ServicesWithOrleansValidator();

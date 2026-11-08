@@ -29,7 +29,8 @@ public sealed class KurrentStorageOptions : IStorageProviderSerializerOptions
     public IKurrentStreamNameProvider StreamNameProvider { get; set; } = new KurrentStreamName();
 
     /// <summary>
-    ///     Controls how log-consistency reads and writes are retried when the Kurrent cluster changes leader.
+    ///     Controls how reads and writes are retried when the Kurrent cluster changes leader or a connection is lost.
+    ///     Applies to both the log-consistency provider and the grain storage provider.
     /// </summary>
     public KurrentRetryOptions Retry { get; set; } = new();
 }

@@ -390,30 +390,10 @@ namespace Orleans.EventSourcing.Kurrent.Tests
 
                 Assert.Equal(0, adapter.ConfirmedVersion);
                 Assert.Equal(0, adapter.ConfirmedView.Balance);
-            }
-            finally
-            {
-                adapter.Dispose();
-            }
-        }
 
-        [Fact]
-        public async Task ClearLogSucceedsWhenSomeoneElseDeletedTheStreamDuringALeaderChange()
-        {
-            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
-
-            try
-            {
-                Assert.True(await adapter.TryAppend(new Applied(100)));
-
-                // This adapter's first attempt fails with NotLeader, and its retry finds the stream deleted by someone else
-                await client.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken);
-                client.AddExceptionToThrowOnceForTesting(streamName, new NotLeaderException("localhost", 2313));
-
-                await adapter.ClearLogAsync(TestContext.Current.CancellationToken);
-
-                Assert.Equal(0, adapter.ConfirmedVersion);
-                Assert.Equal(0, adapter.ConfirmedView.Balance);
+                // The stream is still tombstoned, so it can't be written to again
+                var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
+                Assert.IsType<StreamDeletedException>(ex.InnerException);
             }
             finally
             {
