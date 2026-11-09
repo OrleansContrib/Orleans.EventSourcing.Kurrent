@@ -121,19 +121,60 @@ public sealed class KurrentRetryTests
     }
 
     [Fact]
-    public async Task AStreamingReadIsNotRetriedAfterTheTimeout()
+    public async Task AStreamingReadThatFailsAfterRunningLongerThanTheTimeoutIsStillRetried()
     {
         var attempts = 0;
 
-        // A zero timeout is due before the attempt even starts, so its timer cannot fire after the attempt's own delay
-        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(TimeSpan.Zero), "Test", async token =>
+        // The timeout is measured from the first failure, so time spent reading before it doesn't use up the retries
+        var timeout = TimeSpan.FromMilliseconds(100);
+        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(timeout), "Test", async token =>
+        {
+            if (++attempts == 1)
+            {
+                await Task.Delay(timeout * 3, token);
+                throw Unavailable;
+            }
+
+            return true;
+        }, CancellationToken.None);
+
+        Assert.True(result);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task AStreamingReadStopsBeingRetriedOnceTheTimeoutHasPassedSinceItsFirstFailure()
+    {
+        var attempts = 0;
+
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(TimeSpan.FromMilliseconds(250)), "Test", _ =>
         {
             attempts++;
-            await Task.Delay(ShortTimeout * 3, token);
             throw Unavailable;
         }, CancellationToken.None));
 
-        Assert.Equal(1, attempts);
+        Assert.True(attempts > 1);
+        Assert.Same(Unavailable, ex.InnerException);
+    }
+
+    [Fact]
+    public async Task AStreamingReadThatFailsAgainAfterTheTimeoutIsNotRetriedAgain()
+    {
+        var attempts = 0;
+
+        // The first failure starts the timeout. The retry isn't cut short when it passes, but its failure isn't retried
+        var timeout = TimeSpan.FromMilliseconds(100);
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(timeout), "Test", async token =>
+        {
+            if (++attempts > 1)
+            {
+                await Task.Delay(timeout * 3, token);
+            }
+
+            throw Unavailable;
+        }, CancellationToken.None));
+
+        Assert.Equal(2, attempts);
         Assert.Same(Unavailable, ex.InnerException);
     }
 

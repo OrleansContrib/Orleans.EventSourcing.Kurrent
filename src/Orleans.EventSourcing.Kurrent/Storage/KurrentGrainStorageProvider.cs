@@ -228,6 +228,8 @@ internal sealed class KurrentGrainStorageProvider(IKurrentClient kurrentClient, 
                     throw new InconsistentStateException("StreamState version mismatch", ConvertStreamStateToETag(result.NextExpectedStreamState), grainState.ETag);
                 case ConditionalWriteStatus.Succeeded:
                     break;
+                case ConditionalWriteStatus.StreamDeleted:
+                    throw new InvalidOperationException($"{streamName} has been permanently deleted and cannot be written to ever again");
                 default:
                     throw new NotSupportedException($"Unexpected result from Kurrent: {result.Status}");
             }

@@ -58,6 +58,39 @@ public sealed class KurrentExceptionSerializationTests
         Assert.Equal(2313, inner.LeaderEndpoint.Port);
     }
 
+    // What a caller gets when retries run out: the timeout, holding the last failure
+    [Fact]
+    public void TimeoutHoldingANotLeaderExceptionRoundTrips()
+    {
+        var converted = KurrentExceptionConverter.ConvertException(new TimeoutException("Append did not complete within 00:00:30.", new NotLeaderException("localhost", 2313)));
+        var copy = RoundTrip<InconsistentStateException>(converted);
+
+        var timeout = Assert.IsType<TimeoutException>(copy.InnerException);
+        Assert.Equal("Append did not complete within 00:00:30.", timeout.Message);
+        Assert.Equal(2313, Assert.IsType<NotLeaderException>(timeout.InnerException).LeaderEndpoint.Port);
+    }
+
+    [Fact]
+    public void TimeoutHoldingAnRpcExceptionRoundTrips()
+    {
+        var converted = KurrentExceptionConverter.ConvertException(new TimeoutException("timed out", new RpcException(new Status(StatusCode.Unavailable, "gone"))));
+        var copy = RoundTrip<InconsistentStateException>(converted);
+
+        var timeout = Assert.IsType<TimeoutException>(copy.InnerException);
+        Assert.Equal(StatusCode.Unavailable, Assert.IsType<RpcException>(timeout.InnerException).StatusCode);
+    }
+
+    // The timeout fired during an attempt, before any failure, so it holds the cancellation
+    [Fact]
+    public void TimeoutHoldingACancellationRoundTrips()
+    {
+        var converted = KurrentExceptionConverter.ConvertException(new TimeoutException("timed out", new TaskCanceledException()));
+        var copy = RoundTrip<InconsistentStateException>(converted);
+
+        var timeout = Assert.IsType<TimeoutException>(copy.InnerException);
+        Assert.IsType<TaskCanceledException>(timeout.InnerException);
+    }
+
     private static T RoundTrip<T>(Exception exception) where T : Exception
         => Assert.IsType<T>(Serializer.Deserialize<Exception>(Serializer.SerializeToArray(exception)));
 }

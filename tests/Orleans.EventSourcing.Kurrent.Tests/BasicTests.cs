@@ -199,6 +199,21 @@ public sealed class BasicTests : IAsyncLifetime
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_WriteToATombstonedStream_SaysTheStreamIsDeleted()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var streamName = streamNameProvider.GetStreamName("test", grainId);
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+
+        await kurrentClient.TombstoneStreamAsync(streamName, StreamState.Any, TestContext.Current.CancellationToken);
+
+        state.State.Value = 2;
+        var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken));
+        Assert.Contains("permanently deleted", Assert.IsType<InvalidOperationException>(ex.InnerException).Message);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
     public async Task GrainStorage_MaxCountUpdateWhoseReplyWasLost_IsRetriedWithoutWritingTwice()
     {
         var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));

@@ -102,7 +102,8 @@ internal static class KurrentRetry
     /// <summary>
     ///     As <see cref="ExecuteAsync{T}"/>, for a read of a whole stream whose caller cannot cancel it. The client sets
     ///     no deadline on those and a healthy one can outlast any timeout, so the timeout only stops it being retried,
-    ///     not an attempt in progress.
+    ///     not an attempt in progress. It is measured from the first failure, not from the start of the read: time a
+    ///     long read spent making progress must not use up its retries.
     /// </summary>
     public static Task<T> ExecuteStreamingReadAsync<T>(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task<T>> action, CancellationToken disposeToken)
         => ExecuteCoreAsync(policy, operation, action, streamingRead: true, CancellationToken.None, disposeToken);
@@ -110,7 +111,8 @@ internal static class KurrentRetry
     private static async Task<T> ExecuteCoreAsync<T>(KurrentRetryPolicy policy, string operation, Func<CancellationToken, Task<T>> action, bool streamingRead, CancellationToken callerToken, CancellationToken disposeToken)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(callerToken, disposeToken);
-        if (!callerToken.CanBeCanceled)
+        var timesOut = !callerToken.CanBeCanceled;
+        if (timesOut && !streamingRead)
         {
             cancellation.CancelAfter(policy.Timeout);
         }
@@ -129,6 +131,12 @@ internal static class KurrentRetry
                 }
                 catch (Exception ex) when (IsTransient(ex) && !token.IsCancellationRequested)
                 {
+                    if (timesOut && streamingRead && lastFailure is null)
+                    {
+                        // A streaming read's timeout only limits how long it is retried, so it starts at the first failure
+                        cancellation.CancelAfter(policy.Timeout);
+                    }
+
                     lastFailure = ex;
                     policy.Metrics.Retries.Add(1, new TagList
                     {
@@ -150,7 +158,10 @@ internal static class KurrentRetry
                                    && !disposeToken.IsCancellationRequested
                                    && (IsTransient(ex) || KurrentExceptionConverter.IsRequestedCancellation(ex, token)))
         {
-            throw new TimeoutException($"{operation} did not complete within {policy.Timeout}.", IsTransient(ex) ? ex : lastFailure ?? ex);
+            throw new TimeoutException(streamingRead
+                                           ? $"{operation} was still failing {policy.Timeout} after it first failed."
+                                           : $"{operation} did not complete within {policy.Timeout}.",
+                                       IsTransient(ex) ? ex : lastFailure ?? ex);
         }
     }
 
