@@ -199,6 +199,23 @@ public sealed class BasicTests : IAsyncLifetime
     }
 
     [Fact(Timeout = IntegrationTestTimeout)]
+    public async Task GrainStorage_MaxCountUpdateWhoseReplyWasLost_IsRetriedWithoutWritingTwice()
+    {
+        var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));
+        var streamName = streamNameProvider.GetStreamName("test", grainId);
+        var state = new GrainState<GrainState>(new GrainState { Value = 1 });
+
+        // The $maxCount update after the first write lands but its reply is lost; the retry finds it set and does nothing
+        kurrentClient.AddExceptionToThrowAfterMetadataWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+        await GrainStorage.WriteStateAsync("test", grainId, state, TestContext.Current.CancellationToken);
+        Assert.Equal("0", state.ETag);
+
+        var metadata = await kurrentClient.GetStreamMetadata(streamName, TestContext.Current.CancellationToken);
+        Assert.Equal(1, metadata.Metadata.MaxCount);
+        Assert.Equal(0UL, metadata.MetastreamRevision);
+    }
+
+    [Fact(Timeout = IntegrationTestTimeout)]
     public async Task GrainStorage_WriteWhoseReplyWasLost_IsRetriedWithoutDuplicating()
     {
         var grainId = GrainId.Create("test", Guid.NewGuid().ToString("N"));

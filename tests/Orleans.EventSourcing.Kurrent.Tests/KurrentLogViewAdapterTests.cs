@@ -375,6 +375,29 @@ namespace Orleans.EventSourcing.Kurrent.Tests
         }
 
         [Fact]
+        public async Task TruncationWhoseReplyWasLostIsRetriedWithoutWritingTwice()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                // The $tb update lands but its reply is lost; the retry re-reads the metadata, finds $tb set and does nothing
+                client.AddExceptionToThrowAfterMetadataWriteOnceForTesting(streamName, new RpcException(new Status(StatusCode.Unavailable, "connection reset")));
+
+                Assert.True(await adapter.TryAppendRange([new Applied(25), new Truncate(), new Applied(42)]));
+                Assert.Equal(42, adapter.ConfirmedView.Balance);
+
+                var metadata = await client.GetStreamMetadata(streamName, TestContext.Current.CancellationToken);
+                Assert.Equal(StreamPosition.FromInt64(1), metadata.Metadata.TruncateBefore);
+                Assert.Equal(0UL, metadata.MetastreamRevision);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
         public async Task ClearLogSucceedsWhenSomeoneElseAlreadyDeletedTheStream()
         {
             var (adapter, client, streamName) = CreateLeaderChangeAdapter();
@@ -393,7 +416,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
 
                 // The stream is still tombstoned, so it can't be written to again
                 var ex = await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.TryAppend(new Applied(10)));
-                Assert.IsType<StreamDeletedException>(ex.InnerException);
+                Assert.Contains("permanently deleted", Assert.IsType<InvalidOperationException>(ex.InnerException).Message);
             }
             finally
             {

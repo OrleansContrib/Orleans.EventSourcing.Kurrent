@@ -51,6 +51,11 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
 
     readonly ConcurrentDictionary<string, Exception> afterWriteExceptionToThrowOnce = new();
 
+    // Applies the next metadata update of the stream and then throws, simulating a reply lost after the update landed
+    internal void AddExceptionToThrowAfterMetadataWriteOnceForTesting(string streamName, Exception exception) => afterMetadataWriteExceptionToThrowOnce[streamName] = exception;
+
+    readonly ConcurrentDictionary<string, Exception> afterMetadataWriteExceptionToThrowOnce = new();
+
     private void ThrowIfExceptionAfterWrite(string streamName)
     {
         if (afterWriteExceptionToThrowOnce.Remove(streamName, out var ex))
@@ -92,14 +97,21 @@ internal sealed class ExceptionalKurrentClientWrapper(IKurrentClient passthrough
         return passthrough.ReadStreamAsync(direction, streamName, position, maxCount, resolveLinkTos, cancellationToken);
     }
 
-    public Task<IWriteResult> SetStreamMetadata(string streamName, StreamState expectedRevision, StreamMetadata streamMetadata, CancellationToken token)
+    public async Task<IWriteResult> SetStreamMetadata(string streamName, StreamState expectedRevision, StreamMetadata streamMetadata, CancellationToken token)
     {
         ThrowIfException(streamName);
         if (setMetadataExceptionToThrowOnce.Remove(streamName, out var metaEx))
         {
             throw metaEx;
         }
-        return passthrough.SetStreamMetadata(streamName, expectedRevision, streamMetadata, token);
+
+        var result = await passthrough.SetStreamMetadata(streamName, expectedRevision, streamMetadata, token).ConfigureAwait(false);
+        if (afterMetadataWriteExceptionToThrowOnce.Remove(streamName, out var afterEx))
+        {
+            throw afterEx;
+        }
+
+        return result;
     }
 
     public IAsyncEnumerable<StreamMessage> CatchUpSubscription(FromAll start, IEventFilter eventFilter, uint checkpointInterval, CancellationToken cancellationToken)

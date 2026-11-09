@@ -266,7 +266,7 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 | `ClientSettings` | `KurrentDBClientSettings` used to build the underlying `KurrentClient`. |
 | `GrainStorageSerializer` | Orleans' `IGrainStorageSerializer` used by the default event serializer. |
 | `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `KurrentStreamName.Default`. |
-| `Retry` | `KurrentRetryOptions` controlling how the storage providers retry across a KurrentDB leader change. See below. |
+| `Retry` | `KurrentRetryOptions` controlling how the storage providers retry across a KurrentDB leader change or a lost connection. See below. |
 
 ### Riding out a leader change
 
@@ -280,7 +280,7 @@ That includes `DeadlineExceeded`, which is how calls in flight to a leader that 
 | `Retry` property | Default | Description |
 | --- | --- | --- |
 | `BaseDelay` | `100ms` | Delay before the first retry; doubles on each attempt after that. Must be greater than zero. |
-| `MaxDelay` | `2s` | Upper bound on the delay between attempts. |
+| `MaxDelay` | `2s` | Upper bound on the delay between attempts. Must be at least `BaseDelay` and at most about 49.7 days, the longest delay .NET timers accept. |
 
 How long an operation may run depends on whether its caller can cancel it:
 

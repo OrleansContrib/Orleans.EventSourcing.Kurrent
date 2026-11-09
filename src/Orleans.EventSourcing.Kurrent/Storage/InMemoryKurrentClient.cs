@@ -114,9 +114,10 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
         await singleAccess.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // Real KurrentDB.Client: ConditionalAppendToStreamAsync reports a tombstoned stream as a status, not an exception
             if (tombstoned.Contains(streamName))
             {
-                throw new StreamDeletedException(streamName);
+                return ConditionalWriteResult.StreamDeleted;
             }
 
             var streamState = StreamState.NoStream;
