@@ -122,7 +122,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         try
         {
             // Retry the whole read, not just opening it: a leader change can fail the enumeration too.
-            return await KurrentRetry.ExecuteStreamingReadAsync<IReadOnlyList<TLogEntry>>(context.Retry, "RetrieveLogSegment", async token =>
+            return await KurrentRetry.ExecuteStreamingReadAsync<IReadOnlyList<TLogEntry>>(context.Retry, "RetrieveLogSegment", async (token, progress) =>
             {
                 var readResult = await context.Client.ReadStreamAsync(Direction.Forwards, context.StreamName, fromVersion.ToStreamPosition(), maxCount, false, token)
                                                      .ConfigureAwait(false);
@@ -130,6 +130,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
                 var result = new List<TLogEntry>();
                 await foreach (var resolvedEvent in readResult.WithCancellation(token).ConfigureAwait(false))
                 {
+                    progress.Report();
                     result.Add(Deserialize(context, resolvedEvent));
                 }
 
@@ -584,7 +585,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     private static async Task<LoadResult> LoadAsync(CommandContext context, CancellationToken token)
     {
         // Retry the whole replay, not just opening the read: a leader change can fail the enumeration too.
-        var (result, pendingTruncationPosition) = await KurrentRetry.ExecuteStreamingReadAsync(context.Retry, "Load", t => ReplayAsync(context, t), token).ConfigureAwait(false);
+        var (result, pendingTruncationPosition) = await KurrentRetry.ExecuteStreamingReadAsync(context.Retry, "Load", (t, progress) => ReplayAsync(context, progress, t), token).ConfigureAwait(false);
 
         if (pendingTruncationPosition is { } truncPos)
         {
@@ -594,7 +595,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         return result;
     }
 
-    private static async Task<(LoadResult Result, StreamPosition? PendingTruncationPosition)> ReplayAsync(CommandContext context, CancellationToken token)
+    private static async Task<(LoadResult Result, StreamPosition? PendingTruncationPosition)> ReplayAsync(CommandContext context, KurrentReadProgress progress, CancellationToken token)
     {
         var confirmedView = new TLogView();
         var tentativeView = new TLogView();
@@ -607,6 +608,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         await foreach (var resolvedEvent in readResult.WithCancellation(token).ConfigureAwait(false))
         {
+            progress.Report();
             var deserializedLog = Deserialize(context, resolvedEvent);
             if (IsDeletePriorEventsMarker(deserializedLog) && !firstEventInStream)
             {

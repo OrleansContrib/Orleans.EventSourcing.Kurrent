@@ -111,7 +111,7 @@ public sealed class KurrentRetryTests
     [Fact]
     public async Task AStreamingReadIsNotCancelledByTheTimeout()
     {
-        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(ShortTimeout), "Test", async token =>
+        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(ShortTimeout), "Test", async (token, _) =>
         {
             await Task.Delay(ShortTimeout * 3, token);
             return true;
@@ -125,9 +125,9 @@ public sealed class KurrentRetryTests
     {
         var attempts = 0;
 
-        // The timeout is measured from the first failure, so time spent reading before it doesn't use up the retries
+        // The timeout counts time spent failing, so time spent reading before the first failure doesn't use up the retries
         var timeout = TimeSpan.FromMilliseconds(100);
-        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(timeout), "Test", async token =>
+        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(timeout), "Test", async (token, _) =>
         {
             if (++attempts == 1)
             {
@@ -147,7 +147,7 @@ public sealed class KurrentRetryTests
     {
         var attempts = 0;
 
-        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(TimeSpan.FromMilliseconds(250)), "Test", _ =>
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(TimeSpan.FromMilliseconds(250)), "Test", (_, _) =>
         {
             attempts++;
             throw Unavailable;
@@ -158,13 +158,13 @@ public sealed class KurrentRetryTests
     }
 
     [Fact]
-    public async Task AStreamingReadThatFailsAgainAfterTheTimeoutIsNotRetriedAgain()
+    public async Task AStreamingReadRetryThatFailsWithoutProgressAfterTheTimeoutIsNotRetriedAgain()
     {
         var attempts = 0;
 
-        // The first failure starts the timeout. The retry isn't cut short when it passes, but its failure isn't retried
+        // The first failure starts the timeout. The retry isn't cut short when it passes, but it received nothing, so its failure isn't retried
         var timeout = TimeSpan.FromMilliseconds(100);
-        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(timeout), "Test", async token =>
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(timeout), "Test", async (token, _) =>
         {
             if (++attempts > 1)
             {
@@ -179,11 +179,60 @@ public sealed class KurrentRetryTests
     }
 
     [Fact]
+    public async Task AStreamingReadRetryThatMadeProgressRestartsTheTimeout()
+    {
+        var attempts = 0;
+
+        // The retry outlasts the timeout that the first failure started, but it was receiving events, not failing,
+        // so when it fails too (say, the next node of a rolling restart) the read is retried again
+        var timeout = TimeSpan.FromMilliseconds(100);
+        var result = await KurrentRetry.ExecuteStreamingReadAsync(Policy(timeout), "Test", async (token, progress) =>
+        {
+            switch (++attempts)
+            {
+                case 1:
+                    throw Unavailable;
+                case 2:
+                    progress.Report();
+                    await Task.Delay(timeout * 3, token);
+                    throw Unavailable;
+                default:
+                    return true;
+            }
+        }, CancellationToken.None);
+
+        Assert.True(result);
+        Assert.Equal(3, attempts);
+    }
+
+    [Fact]
+    public async Task ProgressInOneAttemptOfAStreamingReadIsNotCreditedToTheNext()
+    {
+        var attempts = 0;
+
+        // The first attempt received events before failing. The retry received nothing and failed after the timeout
+        var timeout = TimeSpan.FromMilliseconds(100);
+        await Assert.ThrowsAsync<TimeoutException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(timeout), "Test", async (token, progress) =>
+        {
+            if (++attempts == 1)
+            {
+                progress.Report();
+                throw Unavailable;
+            }
+
+            await Task.Delay(timeout * 3, token);
+            throw Unavailable;
+        }, CancellationToken.None));
+
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
     public async Task DisposalStopsAStreamingRead()
     {
         using var dispose = new CancellationTokenSource(ShortTimeout);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(LongTimeout), "Test", async token =>
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => KurrentRetry.ExecuteStreamingReadAsync<bool>(Policy(LongTimeout), "Test", async (token, _) =>
         {
             await Task.Delay(Timeout.Infinite, token);
             return true;
