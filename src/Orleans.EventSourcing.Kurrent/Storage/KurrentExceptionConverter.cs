@@ -22,7 +22,7 @@ internal static class KurrentExceptionConverter
         InconsistentStateException inconsistentStateException => inconsistentStateException,
 
         // Pass as wrapped Innerexception
-        RpcException or TimeoutException or ArgumentNullException or InvalidOperationException or ArgumentOutOfRangeException => new InconsistentStateException($"Kurrent encountered a problem: ${exception.Message}", exception),
+        RpcException or NotLeaderException or DiscoveryException or TimeoutException or ArgumentNullException or InvalidOperationException or ArgumentOutOfRangeException => new InconsistentStateException($"Kurrent encountered a problem: ${exception.Message}", exception),
         WrongExpectedVersionException ex => new InconsistentStateException($"Version mismatch: ${exception.Message}", $"{ex.ActualVersion:N}", $"{ex.ExpectedVersion:N}", ex),
         StreamDeletedException ex => new InconsistentStateException($"Stream deleted: ${exception.Message}", ex),
 

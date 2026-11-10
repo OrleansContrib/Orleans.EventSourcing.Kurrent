@@ -179,7 +179,7 @@ public sealed class AccountGrain : JournaledGrain<AccountState, AccountEvent>, I
 
 ### Deleting the event stream
 
-The log-consistency provider [tombstones](https://docs.kurrent.io/clients/python/v1.2/delete-stream.html#tombstone-stream) the event stream using `JournaledGrain.ClearLogAsync`.
+The log-consistency provider [tombstones](https://docs.kurrent.io/clients/python/v1.2/delete-stream.html#tombstone-stream) the event stream using `JournaledGrain.ClearLogAsync`. If the stream is already tombstoned, for example by another activation, `ClearLogAsync` still succeeds: the stream ends up deleted either way.
 
 > **Note:** Once tombstoned a stream cannot be reused in Kurrent. To truncate the stream use the `DiscardPriorEvents` attribute instead.
 
@@ -266,6 +266,41 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 | `ClientSettings` | `KurrentDBClientSettings` used to build the underlying `KurrentClient`. |
 | `GrainStorageSerializer` | Orleans' `IGrainStorageSerializer` used by the default event serializer. |
 | `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `KurrentStreamName.Default`. |
+| `Retry` | `KurrentRetryOptions` controlling how the storage providers retry across a KurrentDB leader change or a lost connection. See below. |
+
+### Riding out a leader change
+
+When a KurrentDB cluster changes leader, the client's next request to the old leader fails with `NotLeaderException` before anything is written, and the client then reconnects to the new leader. Both storage providers (and so the reminders provider, which is built on the log-consistency provider) retry those requests, so a leader change shows up as extra latency rather than failed grain calls. They retry `NotLeaderException`, `DiscoveryException`, gRPC `Unavailable` failures, and calls whose HTTP/2 stream or connection failed: reset, closed or aborted by the node (for example as it shut down, or as a frozen leader resumed), or declared dead because the node stopped answering keepalive pings. Any HTTP/2 error code is retried except `HTTP_1_1_REQUIRED`, which means the endpoint doesn't support HTTP/2; the code says why the node gave up on the call, not whether a retry would succeed. Retries use exponential backoff and jitter. Other failures, and cancellation, are not retried.
+
+That includes `DeadlineExceeded`, which is how calls in flight to a leader that died without closing its connections end. The client does not reconnect after it, so a retry would hang on the same dead connection, and those calls fail when the client's `DefaultDeadline` expires.
+
+- Log-consistency provider: appends, stream loads, `RetrieveLogSegment`, truncation metadata updates and tombstones.
+- Grain storage provider: state reads, writes and clears, and the `$maxCount` metadata update.
+
+| `Retry` property | Default | Description |
+| --- | --- | --- |
+| `BaseDelay` | `100ms` | Delay before the first retry; doubles on each attempt after that. Must be greater than zero. |
+| `MaxDelay` | `2s` | Upper bound on the delay between attempts. Must be at least `BaseDelay` and at most about 49.7 days, the longest delay .NET timers accept. |
+
+How long an operation may run depends on whether its caller can cancel it:
+
+- If the caller passes a cancellable token, such as to `IGrainStorage` or `ClearLogAsync`, the caller decides how long to wait. Retries continue for as long as the failure lasts, until that token fires. A token you never cancel means retrying indefinitely. That includes the token Orleans gives a grain method: it isn't cancelled when the call times out unless you set `MessagingOptions.CancelRequestOnTimeout`.
+- Otherwise, as with `JournaledGrain` writes and activation loads or a storage call made with `CancellationToken.None`, the operation is cancelled after the Orleans `ResponseTimeout` (30s by default) and fails with a `TimeoutException` inside an `InconsistentStateException`. A write cut short this way may still have landed, so as with any write that fails, the log adapter treats the stream state as unknown until it reloads. The time is measured separately for each step of an operation, such as an append and the truncation update that follows it, and starts when that step starts running, not when it was queued.
+
+Reading a whole stream (a `JournaledGrain` load or `RetrieveLogSegment`) is the exception to the timeout. The client sets no deadline on those and a long stream can legitimately take longer than any timeout, so the timeout only stops a failed read being retried, not a read in progress. It only counts time the read spends failing: it starts when the read first fails, and starts again whenever a retry receives events before failing. So a long read that fails late is still retried, and so is a long retry that fails in turn.
+
+Each attempt is separately limited by the client: `DefaultDeadline` (10s by default) applies to everything except streaming reads, and gRPC keepalive (`keepAliveInterval` and `keepAliveTimeout` in the connection string, 10s each by default) usually detects a dead connection after about 20 seconds. See the limits below for when it doesn't.
+
+Retried writes are safe: each attempt resends the same events (same event IDs) at the same expected stream version, so if an earlier attempt did land, KurrentDB acknowledges the duplicate instead of writing it twice. The one exception is the first grain storage write after `ClearStateAsync`: if it lands and its reply is lost, KurrentDB rejects the resend, so the write fails with a version-mismatch `InconsistentStateException` although the state was stored, once. The grain recovers when it re-reads its state. Resending a soft delete that already landed succeeds again. Resending a tombstone that already landed finds the stream deleted, which counts as done. Retries are counted in the `Retries` metric of the `Orleans.EventSourcing.Kurrent` meter, tagged by operation and exception type.
+
+#### Limits: a frozen or partitioned leader
+
+A leader that is stopped or killed closes its connections, or its restart makes the client reconnect. A leader that freezes, or that the network cuts off, does neither: it stops answering without closing anything, and the followers elect a new leader within seconds.
+
+- **KurrentDB.Client 1.2.0 doesn't fail over in that case.** It only looks for a new leader after `NotLeaderException` or `Unavailable`, but a dead connection fails with gRPC `Internal` (the keepalive timeout). The client keeps reconnecting to the frozen node, and writes stop until that node comes back. A client fix is proposed in [kurrent-io/KurrentDB-Client-Dotnet#434](https://github.com/kurrent-io/KurrentDB-Client-Dotnet/pull/434).
+- **On .NET 8 and 10, keepalive doesn't run on a full HTTP/2 connection.** .NET only checks connections that have room for another call, so a connection already at the server's limit on concurrent calls when the leader froze is never pinged. Calls on it hang until something cancels them: a JournaledGrain load until Orleans' activation timeout, other calls until their own timeout. This is [dotnet/runtime#120179](https://github.com/dotnet/runtime/issues/120179), fixed for .NET 11.
+
+With the client fix, load tests with the leader frozen for 90s saw writes stop for 20 to 45 seconds, though no acknowledged write was lost.
 
 ### Custom event stream naming
 

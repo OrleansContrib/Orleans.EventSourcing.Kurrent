@@ -33,7 +33,7 @@ public static class ClientBuilderExtensions
     => builder.ConfigureServices(services =>
     {
             configureOptions?.Invoke(services.AddOptions<KurrentClusteringOptions>());
-            services.TryAddTransient<IConfigurationValidator>(sp => new KurrentClusteringOptionsValidator(sp.GetRequiredService<IOptions<KurrentClusteringOptions>>().Value));
+            services.AddTransient<IConfigurationValidator>(sp => new KurrentClusteringOptionsValidator(sp.GetRequiredService<IOptions<KurrentClusteringOptions>>().Value));
             services.TryAddSingleton(sp => KurrentClientFactory.Create(sp));
             services.TryAddSingleton(KurrentMembershipEventStorageFactory.Create);
             services.TryAddSingleton<IGatewayListProvider, KurrentGatewayListProvider>();

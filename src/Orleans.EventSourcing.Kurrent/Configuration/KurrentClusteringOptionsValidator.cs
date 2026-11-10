@@ -14,7 +14,7 @@ internal sealed class KurrentClusteringOptionsValidator(KurrentClusteringOptions
 
         if (_options.EventCountBeforeSnapshot < 0) 
         {
-            throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentClusteringOptions)}. {nameof(KurrentClusteringOptions)}.{nameof(_options.EventCountBeforeSnapshot)} must be greater than zero.");
+            throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentClusteringOptions)}. {nameof(KurrentClusteringOptions)}.{nameof(_options.EventCountBeforeSnapshot)} must not be negative.");
         }
 
         if (string.IsNullOrWhiteSpace(_options.StreamPrefix))
