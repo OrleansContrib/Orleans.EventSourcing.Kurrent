@@ -72,9 +72,9 @@ internal static class KurrentRetry
     /// <summary>
     ///     True for failures that clear once the client has found the new leader or reconnected.
     ///     <see cref="NotLeaderException"/> and <see cref="DiscoveryException"/> are raised before the request is
-    ///     accepted. An <see cref="StatusCode.Unavailable"/> failure, or a lost HTTP/2 connection (closed or aborted by
-    ///     the server, or a keepalive ping that went unanswered, mid-call or while the call was starting; see
-    ///     <see cref="IsBrokenConnection"/>), leaves the outcome unknown; that is safe because an append is only retried
+    ///     accepted. An <see cref="StatusCode.Unavailable"/> failure, or a failed HTTP/2 stream or connection (reset,
+    ///     closed or aborted by the server, or a keepalive ping that went unanswered, mid-call or while the call was
+    ///     starting; see <see cref="IsBrokenConnection"/>), leaves the outcome unknown; that is safe because an append is only retried
     ///     with the same event IDs and expected version, which Kurrent treats as idempotent. <see cref="StatusCode.DeadlineExceeded"/> is
     ///     not retried: the client does not reconnect after it, so a retry would hang on the same dead connection.
     /// </summary>
@@ -82,17 +82,23 @@ internal static class KurrentRetry
         => exception is NotLeaderException or DiscoveryException or RpcException { StatusCode: StatusCode.Unavailable }
            || (exception is RpcException { StatusCode: StatusCode.Internal, Status.DebugException: { } debug } && IsBrokenConnection(debug));
 
-    // HTTP/2 error codes (RFC 9113 section 7) that mean the connection was lost rather than misused
-    private const long Http2NoError = 0x0;       // The server closed the connection (GOAWAY), e.g. as it shut down
-    private const long Http2ProtocolError = 0x1; // .NET's code for a keepalive ping that went unanswered
-    private const long Http2InternalError = 0x2; // The server aborted the connection, e.g. as it shut down
+    // The one HTTP/2 error code (RFC 9113 section 7) a retry can't clear: the endpoint doesn't support HTTP/2
+    private const long Http2Http11Required = 0xd;
 
     /// <summary>
-    ///     True when the HTTP/2 connection was lost: the server closed or aborted it, or stopped answering keepalive
-    ///     pings. A call that fails mid-call reports the <see cref="HttpProtocolException"/> directly. A call that fails
-    ///     while starting reports an <see cref="HttpRequestException"/> wrapping it. Other error codes, such as
-    ///     HTTP_1_1_REQUIRED from an endpoint that doesn't support HTTP/2, won't clear on a retry. A PROTOCOL_ERROR from
-    ///     a healthy server can't be told apart from a keepalive timeout, so it is retried until the timeout.
+    ///     True when the server reset the call's HTTP/2 stream, or closed or aborted its connection, with any error code
+    ///     but HTTP_1_1_REQUIRED, or when the node stopped answering keepalive pings (.NET reports PROTOCOL_ERROR). A call
+    ///     that fails mid-call reports the <see cref="HttpProtocolException"/> directly. A call that fails while starting
+    ///     reports an <see cref="HttpRequestException"/> wrapping it.
+    ///     <para>
+    ///     The error code says why the server gave up on the call, not whether a retry would succeed: a node whose
+    ///     connection faulted can send any of them (KurrentDB sends STREAM_CLOSED when a frozen leader resumes), and the
+    ///     code alone can't tell that apart from a bug. So every code is retried, as HTTP resilience libraries retry any
+    ///     failed request; one that won't clear costs only retries until the timeout. HTTP_1_1_REQUIRED is the exception,
+    ///     since it comes from an endpoint that will never accept the call. Codes that Grpc.Net.Client reports as another
+    ///     status don't reach here: REFUSED_STREAM is <see cref="StatusCode.Unavailable"/>, and so retried, while CANCEL,
+    ///     ENHANCE_YOUR_CALM and INADEQUATE_SECURITY are not.
+    ///     </para>
     /// </summary>
     private static bool IsBrokenConnection(Exception debug)
     {
@@ -100,7 +106,7 @@ internal static class KurrentRetry
         {
             if (current is HttpProtocolException protocolException)
             {
-                return protocolException.ErrorCode is Http2NoError or Http2ProtocolError or Http2InternalError;
+                return protocolException.ErrorCode != Http2Http11Required;
             }
         }
 

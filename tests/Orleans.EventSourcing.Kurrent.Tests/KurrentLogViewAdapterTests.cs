@@ -687,9 +687,12 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             // A call that fails while starting because the node stopped answering keepalive pings (.NET reports PROTOCOL_ERROR)
             { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", new HttpProtocolException(0x1, "The HTTP/2 server didn't respond to a ping request within the configured KeepAlivePingDelay.", null)))), true },
             { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException("Some other failure."))), false },
-            // HTTP_1_1_REQUIRED and FLOW_CONTROL_ERROR won't clear on a retry, whether reported directly or wrapped (see Http2ResetClassificationTests for what a real connection reports)
+            // Any other HTTP/2 error code is retried, such as STREAM_CLOSED from a frozen leader that resumed
+            { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "The HTTP/2 server closed the connection. HTTP/2 error code 'STREAM_CLOSED' (0x5).", new HttpProtocolException(0x5, "The HTTP/2 server closed the connection. HTTP/2 error code 'STREAM_CLOSED' (0x5).", null)))), true },
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0x3, "Flow control error.", null))), true },
+            // HTTP_1_1_REQUIRED won't clear on a retry, whether reported directly or wrapped (see Http2ResetClassificationTests for what a real connection reports)
             { new RpcException(new Status(StatusCode.Internal, "Error starting gRPC call.", new HttpRequestException(HttpRequestError.HttpProtocolError, "HTTP/1.1 required.", new HttpProtocolException(0xd, "HTTP/1.1 required.", null)))), false },
-            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0x3, "Flow control error.", null))), false },
+            { new RpcException(new Status(StatusCode.Internal, "Error reading next message.", new HttpProtocolException(0xd, "HTTP/1.1 required.", null))), false },
             { new RpcException(new Status(StatusCode.Internal, "internal")), false },
             { new RpcException(new Status(StatusCode.Cancelled, "cancelled")), false },
             { new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")), false },
