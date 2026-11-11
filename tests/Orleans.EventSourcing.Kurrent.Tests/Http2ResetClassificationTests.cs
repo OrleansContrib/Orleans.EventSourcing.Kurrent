@@ -102,9 +102,11 @@ public sealed class Http2ResetClassificationTests
         }
         finally
         {
+            // The listener is stopped only once the server has: a client may reconnect as the test ends, and a server
+            // that accepts that connection goes on to accept another, which throws on a stopped listener
             await stop.CancelAsync();
-            listener.Stop();
             await server;
+            listener.Stop();
         }
     }
 
