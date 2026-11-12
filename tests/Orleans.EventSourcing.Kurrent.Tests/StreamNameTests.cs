@@ -94,6 +94,47 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             Assert.Equal(default, grainId.Key);
         }
 
+        // Keys in the shape Orleans.Multitenant produces: "{tenant}|{key}", with | in the tenant doubled,
+        // ~ prefixed to keys that start with | or ~, and the null tenant's | doubled.
+        static readonly string[] MultitenantKeys =
+        [
+            "tenant|key",
+            "ten||ant|key",
+            "tenant|~|key",
+            "tenant|~~key",
+            "tenant|",
+            "||key||",
+            "a-b|c-d",
+            @"a\b|c\|d",
+            "$tenant|$key",
+        ];
+
+        public static TheoryData<string> MultitenantKeyData() => new(MultitenantKeys);
+
+        [Theory]
+        [MemberData(nameof(MultitenantKeyData))]
+        public void MultitenantKeysRoundtrip(string key)
+        {
+            var grainId = GrainId.Create("mt-type|x", key);
+
+            Assert.Equal(grainId, kurrentStreamName.GetGrainId(kurrentStreamName.GetStreamName(grainId)));
+            Assert.Equal(grainId, kurrentStreamName.GetGrainId(kurrentStreamName.GetStreamName("state|-", grainId)));
+        }
+
+        [Fact]
+        public void MultitenantKeysGetDistinctStreamNames()
+        {
+            var logStreams = MultitenantKeys.Select(k => kurrentStreamName.GetStreamName(GrainId.Create("type", k))).ToList();
+            var stateStreams = MultitenantKeys.SelectMany(k => new[] { "state", "|state", "state|" }.Select(s => kurrentStreamName.GetStreamName(s, GrainId.Create("type", k)))).ToList();
+
+            Assert.Equal(logStreams.Count, logStreams.Distinct(StringComparer.Ordinal).Count());
+            Assert.Equal(stateStreams.Count, stateStreams.Distinct(StringComparer.Ordinal).Count());
+        }
+
+        [Fact]
+        public void MultitenantKeyPipeIsEscaped()
+            => Assert.Equal(@"type-tenant\|key|state", kurrentStreamName.GetStreamName("state", GrainId.Create("type", "tenant|key")));
+
         [Fact]
         public void GetGrainIdUnsupportedFormatThrows()
         { 
