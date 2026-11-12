@@ -1,3 +1,5 @@
+using Orleans.EventSourcing.Kurrent.Storage;
+
 namespace Orleans.EventSourcing.Kurrent.Configuration;
 
 internal sealed class KurrentStorageOptionsValidator(KurrentStorageOptions options, string name) : IConfigurationValidator
@@ -14,6 +16,19 @@ internal sealed class KurrentStorageOptionsValidator(KurrentStorageOptions optio
         if (_options.StreamNameProvider is null)
         {
             throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentStorageOptions)} with name {name}. {nameof(KurrentStorageOptions)}.{nameof(_options.StreamNameProvider)} is required.");
+        }
+        if (_options.Retry is null)
+        {
+            throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentStorageOptions)} with name {name}. {nameof(KurrentStorageOptions)}.{nameof(_options.Retry)} is required.");
+        }
+        if (_options.Retry.BaseDelay <= TimeSpan.Zero || _options.Retry.MaxDelay < _options.Retry.BaseDelay)
+        {
+            throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentStorageOptions)} with name {name}. {nameof(KurrentStorageOptions)}.{nameof(_options.Retry)} requires 0 < {nameof(KurrentRetryOptions.BaseDelay)} <= {nameof(KurrentRetryOptions.MaxDelay)}.");
+        }
+        // The delay between attempts never exceeds MaxDelay, and Task.Delay rejects anything longer than this
+        if (_options.Retry.MaxDelay > KurrentRetryPolicy.MaxTimeout)
+        {
+            throw new OrleansConfigurationException($"Invalid configuration for {nameof(KurrentStorageOptions)} with name {name}. {nameof(KurrentStorageOptions)}.{nameof(_options.Retry)}.{nameof(KurrentRetryOptions.MaxDelay)} must not exceed {KurrentRetryPolicy.MaxTimeout}.");
         }
     }
 }
