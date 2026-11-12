@@ -46,7 +46,24 @@ builder.UseOrleans(silo =>
 
 var host = builder.Build();
 
+// When launched by the load test client (the rolling scenario), stdin is a control channel: a "stop"
+// line shuts the silo down gracefully, and so does end-of-stream, so a silo never outlives the client.
+if (Environment.GetEnvironmentVariable("LOADTEST_STDIN_CONTROL") == "1")
+{
+    var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+    _ = Task.Run(async () =>
+    {
+        while (await Console.In.ReadLineAsync() is { } line && line.Trim() != "stop")
+        {
+        }
+
+        lifetime.StopApplication();
+    });
+}
+
 Console.WriteLine($"LoadTest silo starting (Kurrent: {connectionString}, serializer: {serializerName})...");
 await host.StartAsync();
-Console.WriteLine("LoadTest silo is running. Press Ctrl+C to shut down.");
+var siloAddress = host.Services.GetRequiredService<ILocalSiloDetails>().SiloAddress;
+Console.WriteLine($"LoadTest silo is running at {siloAddress}. Press Ctrl+C to shut down.");
 await host.WaitForShutdownAsync();
+Console.WriteLine($"LoadTest silo {siloAddress} stopped.");
