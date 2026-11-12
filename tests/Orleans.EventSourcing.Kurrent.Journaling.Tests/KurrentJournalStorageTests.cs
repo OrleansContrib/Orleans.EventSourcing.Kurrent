@@ -304,6 +304,89 @@ public sealed class KurrentJournalStorageTests : IAsyncDisposable
         => Assert.Throws<ArgumentException>(() => TestExtensions.CreateStorage(kurrent, "$system"));
 
     [Fact]
+    public async Task WritesBeforeReadingAreRejected()
+    {
+        // The write precondition comes from the instance's first read; without one there is nothing to check a write against.
+        var storage = TestExtensions.CreateStorage(kurrent, streamName);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await storage.AppendAsync("a;"));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await storage.ReplaceAsync("snapshot;"));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await storage.DeleteAsync(TestContext.Current.CancellationToken));
+        Assert.Empty(await kurrent.ReadVisibleEventsAsync(streamName));
+    }
+
+    [Fact]
+    public async Task EmptyAppendIsRejected()
+    {
+        var storage = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(storage);
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () => await storage.AppendAsync(string.Empty));
+    }
+
+    [Fact]
+    public async Task RereadSeesOwnWrites()
+    {
+        var storage = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(storage);
+        await storage.AppendAsync("a;");
+        await storage.ReplaceAsync("snapshot;");
+        await storage.AppendAsync("b;");
+
+        var consumer = await CollectingConsumer.ReadAsync(storage);
+
+        Assert.Equal("snapshot;b;", consumer.Text);
+        await storage.AppendAsync("c;");
+    }
+
+    [Fact]
+    public async Task RereadAfterAnotherWriterThrows()
+    {
+        var first = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(first);
+        await first.AppendAsync("a;");
+
+        var second = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(second);
+        await second.AppendAsync("b;");
+
+        await Assert.ThrowsAsync<InconsistentStateException>(async () => await CollectingConsumer.ReadAsync(first));
+    }
+
+    [Fact]
+    public async Task ReadDetectsCompactionBetweenPages()
+    {
+        var writer = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(writer);
+        await writer.AppendAsync("a;");
+        await writer.AppendAsync("b;");
+        await writer.AppendAsync("c;");
+        await writer.AppendAsync("d;");
+
+        // Another writer compacts after the reader's first page, hiding the older events the reader still needs.
+        var client = new InterceptingKurrentClient(kurrent) { AfterNextRead = async () => await writer.ReplaceAsync("snapshot;") };
+        var reader = TestExtensions.CreateStorage(client, streamName, new KurrentJournalStorageOptions { ReadPageSize = 2 });
+
+        await Assert.ThrowsAsync<InconsistentStateException>(async () => await CollectingConsumer.ReadAsync(reader));
+    }
+
+    [Fact]
+    public async Task RevivedJournalWithoutSnapshotReadsWhole()
+    {
+        var storage = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(storage);
+        await storage.AppendAsync("old;");
+        await storage.DeleteAsync(TestContext.Current.CancellationToken);
+
+        // After a soft delete the stream starts at its truncation point, without a snapshot, and that is a whole journal.
+        await storage.AppendAsync("x;");
+        await storage.AppendAsync("y;");
+
+        var reader = TestExtensions.CreateStorage(kurrent, streamName, new KurrentJournalStorageOptions { ReadPageSize = 1 });
+        Assert.Equal("x;y;", (await CollectingConsumer.ReadAsync(reader)).Text);
+    }
+
+    [Fact]
     public async Task MultiStreamAppendSupportMatchesServerVersion()
     {
         Assert.SkipUnless(TestKurrent.UseRealKurrent, "Needs a real server to compare with its version.");

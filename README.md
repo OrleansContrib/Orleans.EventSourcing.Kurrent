@@ -300,9 +300,9 @@ Orleans Journaling APIs raise the `ORLEANSEXP005` diagnostic; suppress it with `
 
 - Each journal is stored in the stream `orleansjournal-{JournalId}` (override with `KurrentJournalStorageOptions.GetStreamName`). The prefix makes `orleansjournal` the KurrentDB category of every journal stream.
 - Each append becomes an `orleans.journal.append` event. Writes larger than `MaxEventSize` (512 KiB) are split across several events in one atomic append.
-- Concurrent writers are detected with the stream revision: a second activation writing the same journal fails with `InconsistentStateException`.
+- Concurrent writers are detected with the stream revision. Each storage instance takes its write precondition from its first read and advances it with its own writes: a second activation writing the same journal fails with `InconsistentStateException`, writing before reading throws `InvalidOperationException`, and rereading after another writer changed the journal throws `InconsistentStateException`. This follows the stricter `IJournalStorage` contract on the Orleans main branch.
 - Once `CompactionEventCountThreshold` (1,000) events or `CompactionSizeThreshold` (4 MiB) of journal bytes have been appended since the last snapshot, Orleans asks for compaction. The provider then appends an `orleans.journal.snapshot` event and moves the stream's `$tb` (truncate before) metadata to it, so older events are hidden and later scavenged. Other stream metadata (ACLs, `$maxAge`, custom properties) is preserved.
-- Recovery reads backwards to the latest snapshot and replays from there, so it never depends on truncation having succeeded.
+- Recovery reads backwards to the latest snapshot and replays from there, so it never depends on truncation having succeeded. If another writer compacts or deletes the journal while it is being read, the read fails with `InconsistentStateException` rather than returning part of the journal.
 - Clearing state soft-deletes the stream, so the journal can be written again later.
 
 ### Atomic compaction

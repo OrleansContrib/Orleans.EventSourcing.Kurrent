@@ -20,8 +20,11 @@ namespace Orleans.EventSourcing.Kurrent.Journaling;
 ///     supports multi-stream appends, the snapshot and the metadata are written in one atomic operation.
 ///     </para>
 ///     <para>
-///     Optimistic concurrency uses the stream revision observed by the last read or write, so a second activation
-///     writing the same journal causes <see cref="InconsistentStateException"/>.
+///     Each instance holds a write precondition: the stream revision its first read observed (including an absent
+///     stream), advanced by its own writes. Writes succeed only while the stream is still at that revision, so a
+///     second activation writing the same journal causes <see cref="InconsistentStateException"/>. Writing before
+///     reading throws <see cref="InvalidOperationException"/>, and a later read throws
+///     <see cref="InconsistentStateException"/> if another writer changed the stream since.
 ///     Orleans serializes calls to a storage instance, so this type is not thread-safe.
 ///     </para>
 /// </remarks>
@@ -34,6 +37,8 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     private readonly KurrentJournalStorageOptions options;
     private readonly ILogger logger;
 
+    // The write precondition: set by the first read, then advanced by this instance's own writes.
+    private bool hasPrecondition;
     private StreamState streamState = StreamState.NoStream;
     private long eventsSinceSnapshot;
     private long bytesSinceSnapshot;
@@ -70,6 +75,8 @@ internal sealed class KurrentJournalStorage : IJournalStorage
         // not replay anything before that snapshot, even if a failed compaction left older events untruncated.
         var events = new List<JournalEvent>();
         var lastRevision = StreamState.NoStream;
+        var oldestEventNumber = 0UL;
+        var foundSnapshot = false;
         var position = StreamPosition.End;
         var foundStart = false;
         while (!foundStart)
@@ -77,38 +84,60 @@ internal sealed class KurrentJournalStorage : IJournalStorage
             var result = await client.ReadStreamAsync(Direction.Backwards, streamName, position, options.ReadPageSize, resolveLinkTos: false, cancellationToken).ConfigureAwait(false);
 
             var count = 0;
-            var lowestEventNumber = 0UL;
             await foreach (var resolvedEvent in result.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 count++;
-                lowestEventNumber = resolvedEvent.Event.EventNumber.ToUInt64();
+                oldestEventNumber = resolvedEvent.Event.EventNumber.ToUInt64();
                 if (lastRevision == StreamState.NoStream)
                 {
-                    lastRevision = StreamState.StreamRevision(lowestEventNumber);
+                    lastRevision = StreamState.StreamRevision(oldestEventNumber);
                 }
 
                 var journalEvent = KurrentJournalEvents.Parse(resolvedEvent.Event);
                 events.Add(journalEvent);
                 if (journalEvent.Kind == JournalEventKind.Snapshot)
                 {
+                    foundSnapshot = true;
                     foundStart = true;
                     break;
                 }
             }
 
             // A short page means the start of the stream, or its truncation point, was reached.
-            if (count < options.ReadPageSize || lowestEventNumber == 0)
+            if (count < options.ReadPageSize || oldestEventNumber == 0)
             {
                 foundStart = true;
             }
             else
             {
-                position = new StreamPosition(lowestEventNumber - 1);
+                position = new StreamPosition(oldestEventNumber - 1);
             }
+        }
+
+        // The paged read only returns one whole version of the journal if it reached a snapshot, the first event, or the
+        // stream's own truncation point. Reaching anything else means another writer compacted or deleted the stream
+        // between pages, so the older part of this version is gone.
+        if (!foundSnapshot && oldestEventNumber > 0)
+        {
+            var metadata = await client.GetStreamMetadata(streamName, cancellationToken).ConfigureAwait(false);
+            if (metadata.Metadata.TruncateBefore?.ToUInt64() != oldestEventNumber)
+            {
+                throw new InconsistentStateException(
+                    $"Journal stream '{streamName}' was truncated by another writer while it was being read.",
+                    $"{metadata.Metadata.TruncateBefore}",
+                    $"{oldestEventNumber}");
+            }
+        }
+
+        // A later read must see the journal this instance last observed or wrote; recovery from a conflict uses a fresh instance.
+        if (hasPrecondition && lastRevision != streamState)
+        {
+            throw new InconsistentStateException($"Journal stream '{streamName}' was changed by another writer.", $"{lastRevision}", $"{streamState}");
         }
 
         events.Reverse();
 
+        hasPrecondition = true;
         streamState = lastRevision;
         eventsSinceSnapshot = 0;
         bytesSinceSnapshot = 0;
@@ -143,9 +172,10 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     {
         if (value.IsEmpty)
         {
-            return;
+            throw new ArgumentOutOfRangeException(nameof(value), "A journal segment must contain at least one byte.");
         }
 
+        ThrowIfNoPrecondition();
         var events = KurrentJournalEvents.Create(value, header, isSnapshot: false, options.MaxEventSize);
         await AppendCoreAsync(events, cancellationToken).ConfigureAwait(false);
 
@@ -156,6 +186,7 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     /// <inheritdoc/>
     public async ValueTask ReplaceAsync(ReadOnlySequence<byte> value, CancellationToken cancellationToken)
     {
+        ThrowIfNoPrecondition();
         var events = KurrentJournalEvents.Create(value, header, isSnapshot: true, options.MaxEventSize);
 
         // A new (or deleted) stream has nothing before the snapshot to truncate.
@@ -184,6 +215,7 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     /// <inheritdoc/>
     public async ValueTask DeleteAsync(CancellationToken cancellationToken)
     {
+        ThrowIfNoPrecondition();
         if (streamState != StreamState.NoStream)
         {
             // A soft delete, so the journal can be written again later; a tombstone would prevent that.
@@ -200,6 +232,14 @@ internal sealed class KurrentJournalStorage : IJournalStorage
         streamState = StreamState.NoStream;
         eventsSinceSnapshot = 0;
         bytesSinceSnapshot = 0;
+    }
+
+    private void ThrowIfNoPrecondition()
+    {
+        if (!hasPrecondition)
+        {
+            throw new InvalidOperationException($"Journal stream '{streamName}' must be read before it is written through this storage instance.");
+        }
     }
 
     private async ValueTask AppendCoreAsync(EventData[] events, CancellationToken cancellationToken)

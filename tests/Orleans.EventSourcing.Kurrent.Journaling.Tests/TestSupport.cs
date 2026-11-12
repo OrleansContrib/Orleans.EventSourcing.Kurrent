@@ -75,8 +75,29 @@ internal sealed class InterceptingKurrentClient(IKurrentClient inner) : IKurrent
     public Task<DeleteResult> TombstoneStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
         => inner.TombstoneStreamAsync(streamName, expectedRevision, token);
 
-    public ValueTask<IStreamReadResult> ReadStreamAsync(Direction direction, string streamName, StreamPosition position, long maxCount, bool resolveLinkTos, CancellationToken cancellationToken)
-        => inner.ReadStreamAsync(direction, streamName, position, maxCount, resolveLinkTos, cancellationToken);
+    /// <summary>Runs once, just after the next stream read returns its page, before the caller reads the next page.</summary>
+    public Func<Task>? AfterNextRead { get; set; }
+
+    public async ValueTask<IStreamReadResult> ReadStreamAsync(Direction direction, string streamName, StreamPosition position, long maxCount, bool resolveLinkTos, CancellationToken cancellationToken)
+    {
+        var result = await inner.ReadStreamAsync(direction, streamName, position, maxCount, resolveLinkTos, cancellationToken);
+        if (AfterNextRead is { } after)
+        {
+            AfterNextRead = null;
+
+            // Materialize the page first so the hook runs between pages, as a concurrent writer would
+            var page = new List<ResolvedEvent>();
+            await foreach (var resolvedEvent in result.WithCancellation(cancellationToken))
+            {
+                page.Add(resolvedEvent);
+            }
+
+            await after();
+            return new InMemoryKurrentClient.InMemoryResult(page.ToAsyncEnumerable(), result.LastStreamPosition);
+        }
+
+        return result;
+    }
 
     public Task<ConditionalWriteResult> ConditionalAppendToStreamAsync(string streamName, StreamState expectedRevision, IEnumerable<EventData> eventData, CancellationToken cancellationToken)
         => inner.ConditionalAppendToStreamAsync(streamName, expectedRevision, eventData, cancellationToken);
