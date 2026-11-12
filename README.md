@@ -265,7 +265,7 @@ Reminders are persisted to a single stream. If you have high reminder churn, the
 | --- | --- |
 | `ClientSettings` | `KurrentDBClientSettings` used to build the underlying `KurrentClient`. |
 | `GrainStorageSerializer` | Orleans' `IGrainStorageSerializer` used by the default event serializer. |
-| `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `KurrentStreamName.Default`. |
+| `StreamNameProvider` | `IKurrentStreamNameProvider` controlling stream-name layout. Defaults to `new KurrentStreamName()`. |
 | `Retry` | `KurrentRetryOptions` controlling how the storage providers retry across a KurrentDB leader change or a lost connection. See below. |
 
 ### Riding out a leader change
@@ -309,7 +309,9 @@ The naming scheme is pluggable — see [Custom event stream naming](#custom-even
 Both providers, and the projection subscription, route through `IKurrentStreamNameProvider`. The default produces:
 
 - `{GrainType}-{Key}` for log-consistency streams.
-- `{GrainType}-{stateName}|{Key}` for state-storage streams.
+- `{GrainType}-{Key}|{stateName}` for state-storage streams.
+
+A `-`, `|`, `\` or `$` inside the grain type, key or state name is escaped with `\`, so every grain maps to its own stream and back whatever its key contains. Keys from [Orleans.Multitenant](https://github.com/VincentH-Net/Orleans.Multitenant), which look like `{tenant}|{key}`, work as they are, giving names like `type-tenant\|key|state`.
 
 To change the scheme, implement `IKurrentStreamNameProvider` and assign it on the options for each provider you register:
 
