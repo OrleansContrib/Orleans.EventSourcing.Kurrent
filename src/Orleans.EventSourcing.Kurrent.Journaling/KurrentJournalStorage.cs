@@ -71,8 +71,8 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     {
         ArgumentNullException.ThrowIfNull(consumer);
 
-        // Read backwards until the first event of the latest snapshot (or the start of the stream). Recovery must
-        // not replay anything before that snapshot, even if a failed compaction left older events untruncated.
+        // Read backwards until the first event of the latest snapshot or delete marker (or the start of the stream).
+        // Recovery must not replay anything before it, even if a failed compaction or delete left older events visible.
         var events = new List<JournalEvent>();
         var lastRevision = StreamState.NoStream;
         var oldestEventNumber = 0UL;
@@ -94,6 +94,14 @@ internal sealed class KurrentJournalStorage : IJournalStorage
                 }
 
                 var journalEvent = KurrentJournalEvents.Parse(resolvedEvent.Event);
+                if (journalEvent.Kind == JournalEventKind.Deleted)
+                {
+                    // The journal is empty from the marker on; it carries no journal bytes itself.
+                    foundSnapshot = true;
+                    foundStart = true;
+                    break;
+                }
+
                 events.Add(journalEvent);
                 if (journalEvent.Kind == JournalEventKind.Snapshot)
                 {
@@ -137,6 +145,25 @@ internal sealed class KurrentJournalStorage : IJournalStorage
 
         events.Reverse();
 
+        if (events.Count == 0)
+        {
+            consumer.Complete(metadata: null);
+        }
+        else
+        {
+            // Orleans requires a single format for the whole read. A format migration always writes a snapshot first,
+            // so everything after the latest snapshot shares one format key.
+            var formatKey = events[0].FormatKey;
+            if (events.Any(x => !string.Equals(x.FormatKey, formatKey, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException($"Journal stream '{streamName}' mixes journal format keys after its latest snapshot.");
+            }
+
+            consumer.Read(events.Select(x => x.Payload), new JournalMetadata(formatKey), complete: true);
+        }
+
+        // Only a read the consumer accepted establishes the precondition: a failed recovery must not leave this
+        // instance able to write over a journal it never loaded.
         hasPrecondition = true;
         streamState = lastRevision;
         eventsSinceSnapshot = 0;
@@ -149,22 +176,6 @@ internal sealed class KurrentJournalStorage : IJournalStorage
                 bytesSinceSnapshot += journalEvent.Payload.Length;
             }
         }
-
-        if (events.Count == 0)
-        {
-            consumer.Complete(metadata: null);
-            return;
-        }
-
-        // Orleans requires a single format for the whole read. A format migration always writes a snapshot first,
-        // so everything after the latest snapshot shares one format key.
-        var formatKey = events[0].FormatKey;
-        if (events.Any(x => !string.Equals(x.FormatKey, formatKey, StringComparison.Ordinal)))
-        {
-            throw new InvalidOperationException($"Journal stream '{streamName}' mixes journal format keys after its latest snapshot.");
-        }
-
-        consumer.Read(events.Select(x => x.Payload), new JournalMetadata(formatKey), complete: true);
     }
 
     /// <inheritdoc/>
@@ -216,22 +227,50 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     public async ValueTask DeleteAsync(CancellationToken cancellationToken)
     {
         ThrowIfNoPrecondition();
-        if (streamState != StreamState.NoStream)
+        if (streamState == StreamState.NoStream)
         {
-            // A soft delete, so the journal can be written again later; a tombstone would prevent that.
+            // Nothing to delete, but the journal must still be absent: another writer may have created it since this
+            // instance observed it missing. KurrentDB fails every delete of a missing stream, so check by reading.
+            await ThrowIfStreamExistsAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // A soft-deleted stream still accepts appends at its last revision, so soft-deleting alone would let a writer
+            // holding that revision write to the deleted journal. Appending the delete marker first moves the last
+            // revision past any revision another writer holds, and makes the journal empty from here: the marker
+            // append is where the delete takes effect.
+            await AppendCoreAsync([KurrentJournalEvents.CreateDeleted(header)], cancellationToken).ConfigureAwait(false);
+            eventsSinceSnapshot = 0;
+            bytesSinceSnapshot = 0;
+
+            // A soft delete, so the journal can be written again later; a tombstone would prevent that. If it fails, the
+            // journal is still empty from the marker and this instance can write after it.
             try
             {
                 await client.DeleteStreamAsync(streamName, streamState, cancellationToken).ConfigureAwait(false);
             }
-            catch (WrongExpectedVersionException ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                throw new InconsistentStateException($"Journal stream '{streamName}' was changed by another writer.", $"{ex.ActualStreamState}", $"{streamState}", ex);
+                logger.DeleteFailed(streamName, ex);
+                return;
             }
         }
 
         streamState = StreamState.NoStream;
         eventsSinceSnapshot = 0;
         bytesSinceSnapshot = 0;
+    }
+
+    private async ValueTask ThrowIfStreamExistsAsync(CancellationToken cancellationToken)
+    {
+        var result = await client.ReadStreamAsync(Direction.Backwards, streamName, StreamPosition.End, 1, resolveLinkTos: false, cancellationToken).ConfigureAwait(false);
+        await foreach (var resolvedEvent in result.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            throw new InconsistentStateException(
+                $"Journal stream '{streamName}' was created by another writer.",
+                $"{resolvedEvent.Event.EventNumber}",
+                $"{StreamState.NoStream}");
+        }
     }
 
     private void ThrowIfNoPrecondition()

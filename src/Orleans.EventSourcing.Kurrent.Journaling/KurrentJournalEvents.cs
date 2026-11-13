@@ -30,6 +30,12 @@ internal static class KurrentJournalEvents
     /// <summary>A later event of a snapshot that did not fit in one event.</summary>
     public const string SnapshotContinuedEventType = "orleans.journal.snapshot.continued";
 
+    /// <summary>
+    ///     Marks where the journal was deleted: it is empty from here. Deleting writes this before soft-deleting the stream,
+    ///     so the stream's last revision moves past any revision another writer holds.
+    /// </summary>
+    public const string DeletedEventType = "orleans.journal.deleted";
+
     private const byte HeaderVersion = 1;
     private const string ContentType = "application/octet-stream";
 
@@ -84,6 +90,12 @@ internal static class KurrentJournalEvents
     }
 
     /// <summary>
+    ///     Creates the event that marks where the journal was deleted. It carries the header and no journal bytes.
+    /// </summary>
+    public static EventData CreateDeleted(byte[] header)
+        => new(Uuid.NewUuid(), DeletedEventType, header.ToArray(), contentType: ContentType);
+
+    /// <summary>
     ///     Decodes an event written by <see cref="Create"/>.
     /// </summary>
     /// <exception cref="InvalidOperationException">The event was not written by this provider.</exception>
@@ -94,6 +106,7 @@ internal static class KurrentJournalEvents
             AppendEventType => JournalEventKind.Append,
             SnapshotEventType => JournalEventKind.Snapshot,
             SnapshotContinuedEventType => JournalEventKind.SnapshotContinued,
+            DeletedEventType => JournalEventKind.Deleted,
             _ => throw new InvalidOperationException(
                 $"Event {eventRecord.EventNumber} in journal stream '{eventRecord.EventStreamId}' has unexpected type '{eventRecord.EventType}'."),
         };
@@ -116,6 +129,7 @@ internal enum JournalEventKind
     Append,
     Snapshot,
     SnapshotContinued,
+    Deleted,
 }
 
 internal readonly record struct JournalEvent(JournalEventKind Kind, string FormatKey, ReadOnlyMemory<byte> Payload);

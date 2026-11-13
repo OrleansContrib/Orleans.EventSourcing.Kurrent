@@ -127,7 +127,8 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
             var (streamState, isSoftDeleted) = GetStreamStateCore(streamName);
 
             // StreamState.Any means "no optimistic-concurrency check": accept the append regardless of the current revision.
-            if (expectedRevision != StreamState.Any && streamState != expectedRevision && !isSoftDeleted)
+            // Real KurrentDB: a soft-deleted stream accepts NoStream as well as its last revision, and no other revision.
+            if (expectedRevision != StreamState.Any && streamState != expectedRevision && !(isSoftDeleted && expectedRevision == StreamState.NoStream))
             {
                 // Real KurrentDB: resending a batch that already landed after the expected revision, with the
                 // same event IDs, is acknowledged without writing it twice.
@@ -309,7 +310,8 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
 
     private static bool ExpectedStateMatches(StreamState expected, StreamState actual, bool isSoftDeleted)
     {
-        if (expected == StreamState.Any || isSoftDeleted)
+        // Real KurrentDB: a soft-deleted stream accepts NoStream as well as its last revision, and no other revision.
+        if (expected == StreamState.Any || (isSoftDeleted && expected == StreamState.NoStream))
         {
             return true;
         }
@@ -417,10 +419,11 @@ internal sealed class InMemoryKurrentClient : IKurrentClient
             var currentRevision = StreamState.StreamRevision(all[events[^1]].EventNumber);
 
             // StreamState.Any means "no optimistic-concurrency check": delete regardless of the current revision.
-            // Otherwise validate the revision, honoring metadata truncation.
+            // Real KurrentDB: a soft-deleted stream accepts NoStream as well as its last revision, and no other revision.
+            var isSoftDeleted = metadata.Metadata.TruncateBefore == StreamPosition.End;
             if (expectedRevision != StreamState.Any
                 && currentRevision != expectedRevision
-                && (metadata.Metadata.TruncateBefore is null || all[events[^1]].EventNumber >= metadata.Metadata.TruncateBefore))
+                && !(isSoftDeleted && expectedRevision == StreamState.NoStream))
             {
                 // Revision mismatch, return a failed delete result
                 throw new WrongExpectedVersionException(streamName, expectedRevision, currentRevision);

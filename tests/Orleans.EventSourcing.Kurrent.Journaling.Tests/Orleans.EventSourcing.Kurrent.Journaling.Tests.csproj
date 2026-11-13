@@ -5,6 +5,7 @@
     <NoWarn>$(NoWarn);ORLEANSEXP005</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="CsCheck" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Microsoft.Orleans.TestingHost" />
     <PackageReference Include="xunit.v3" />

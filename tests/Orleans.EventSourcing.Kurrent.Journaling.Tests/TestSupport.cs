@@ -69,8 +69,16 @@ internal sealed class InterceptingKurrentClient(IKurrentClient inner) : IKurrent
     public Task<StreamMetadataResult> GetStreamMetadata(string streamName, CancellationToken token)
         => inner.GetStreamMetadata(streamName, token);
 
+    public Exception? ThrowOnDeleteStream { get; set; }
+
     public Task<DeleteResult> DeleteStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
-        => inner.DeleteStreamAsync(streamName, expectedRevision, token);
+    {
+        if (ThrowOnDeleteStream is { } ex)
+        {
+            throw ex;
+        }
+        return inner.DeleteStreamAsync(streamName, expectedRevision, token);
+    }
 
     public Task<DeleteResult> TombstoneStreamAsync(string streamName, StreamState expectedRevision, CancellationToken token)
         => inner.TombstoneStreamAsync(streamName, expectedRevision, token);

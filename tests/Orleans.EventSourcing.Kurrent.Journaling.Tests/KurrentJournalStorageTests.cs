@@ -262,6 +262,31 @@ public sealed class KurrentJournalStorageTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task DeleteWhoseSoftDeleteFailsStillEmptiesTheJournal()
+    {
+        var client = new InterceptingKurrentClient(kurrent);
+        var storage = TestExtensions.CreateStorage(client, streamName);
+        await CollectingConsumer.ReadAsync(storage);
+        await storage.AppendAsync("old;");
+        var stale = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(stale);
+
+        // The delete marker is written, then the soft delete fails: the delete has still taken effect.
+        client.ThrowOnDeleteStream = new RpcException(new Status(StatusCode.Unavailable, "Injected"));
+        await storage.DeleteAsync(TestContext.Current.CancellationToken);
+        client.ThrowOnDeleteStream = null;
+
+        Assert.Equal(KurrentJournalEvents.DeletedEventType, (await kurrent.ReadVisibleEventsAsync(streamName))[^1].Event.EventType);
+        Assert.Equal(string.Empty, (await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName))).Text);
+        await Assert.ThrowsAsync<InconsistentStateException>(async () => await stale.AppendAsync("stale;"));
+
+        // The deleting instance writes after the marker, and only what follows the marker is replayed.
+        Assert.Equal(string.Empty, (await CollectingConsumer.ReadAsync(storage)).Text);
+        await storage.AppendAsync("new;");
+        Assert.Equal("new;", (await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName))).Text);
+    }
+
+    [Fact]
     public async Task CompactionIsRequestedAfterEventOrSizeThreshold()
     {
         var byCount = TestExtensions.CreateStorage(kurrent, streamName, new KurrentJournalStorageOptions { CompactionEventCountThreshold = 3 });
