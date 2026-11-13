@@ -330,6 +330,12 @@ A server's support for multi-stream appends depends on its version, so tests tha
 
 `tests/Orleans.EventSourcing.Kurrent.Journaling.Tests/Conformance` holds a port of Orleans' journal storage conformance suite (`JournalStorageConformanceTests`, from [dotnet/orleans#11537](https://github.com/dotnet/orleans/pull/11537); not yet in an Orleans release). It covers atomic and ordered writes and reads, write preconditions, reread validation, empty-segment rejection and per-append limits, and it injects aborted requests and lost responses into the client. It runs three times: with atomic compaction, without it, and with small events and read pages. It skips the tests of the metadata operations, which the provider does not implement. Against a real server, it also skips the exact per-append limit tests, because only the emulator's size accounting is known exactly.
 
+To measure throughput, the load test's `durable` scenario ramps durable-state writes from `DurableGrain`s through this provider. It then deactivates every grain and checks that each acknowledged write is recovered from the journal. The silo's `JOURNAL_FORMAT` environment variable selects `binary` (the default) or `json`. See `samples/LoadTest.Client/Program.cs` for options, for example:
+
+```bash
+dotnet run --project samples/LoadTest.Client -c Release -- durable --grains 1000 --batch 2 --slots 16 --payload 256
+```
+
 ### Limitations
 
 - Every write must fit within the server's `MaxAppendSize`, including whole snapshots. It defaults to 1 MiB before KurrentDB 25.1 and to 256 MiB from 25.1, which also limits each event to `MaxAppendEventSize` (16 MiB; keep `MaxEventSize` below it). Raise `MaxAppendSize` on the server if your durable state is larger. An append over the limit fails with `MaximumAppendSizeExceededException`. An atomic compaction over the limit fails with an `RpcException` (`ResourceExhausted`). On .NET 8 that compaction can stall instead, and it then fails with `DeadlineExceeded` after the client's `DefaultDeadline` (10 seconds by default).

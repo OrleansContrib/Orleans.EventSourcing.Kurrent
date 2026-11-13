@@ -5,6 +5,8 @@
     <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
     <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- Orleans Journaling is experimental; every use of its API raises ORLEANSEXP005. -->
+    <NoWarn>$(NoWarn);ORLEANSEXP005</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,6 +19,7 @@
     <ProjectReference Include="..\LoadTest.Grains\LoadTest.Grains.csproj" />
     <ProjectReference Include="..\..\src\Orleans.EventSourcing.Kurrent\Orleans.EventSourcing.Kurrent.csproj" />
     <ProjectReference Include="..\..\src\Orleans.EventSourcing.Kurrent.Reminders\Orleans.EventSourcing.Kurrent.Reminders.csproj" />
+    <ProjectReference Include="..\..\src\Orleans.EventSourcing.Kurrent.Journaling\Orleans.EventSourcing.Kurrent.Journaling.csproj" />
   </ItemGroup>
 
 </Project>

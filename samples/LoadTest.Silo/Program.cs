@@ -3,8 +3,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Orleans.Dashboard;
+using LoadTest.Grains;
 using Orleans.EventSourcing.Kurrent.Hosting;
+using Orleans.EventSourcing.Kurrent.Journaling;
 using Orleans.EventSourcing.Kurrent.Reminders;
+using Orleans.Journaling;
+using Orleans.Journaling.Json;
 using Orleans.Storage;
 
 // Connection string for KurrentDB. The special host "kurrentemulator" selects the in-process,
@@ -19,6 +23,16 @@ var connectionString = Environment.GetEnvironmentVariable("KURRENT_CONNECTION_ST
 // Note: streams written with one serializer cannot be read with the other, so wipe the
 // database (docker compose down -v) when switching.
 var serializerName = (Environment.GetEnvironmentVariable("GRAIN_SERIALIZER") ?? "default").ToLowerInvariant();
+
+// JOURNAL_FORMAT selects the journal format for durable grain state (the durable scenario):
+//   "binary" (default) — Orleans binary journal format
+//   "json"             — JSON Lines
+// Each journal records its format, so switching only affects journals written afterwards.
+var journalFormat = (Environment.GetEnvironmentVariable("JOURNAL_FORMAT") ?? "binary").ToLowerInvariant();
+if (journalFormat is not ("binary" or "json"))
+{
+    throw new ArgumentException($"JOURNAL_FORMAT must be binary or json, not '{journalFormat}'.");
+}
 
 var clientSettings = KurrentDBClientSettings.Create(connectionString);
 
@@ -42,6 +56,17 @@ builder.UseOrleans(silo =>
         }
     }));
     silo.AddKurrentReminderService(o => o.ClientSettings = clientSettings);
+    silo.AddKurrentJournalStorageAsDefault(o => o.ClientSettings = clientSettings);
+    if (journalFormat == "json")
+    {
+        silo.UseJsonJournalFormat(DurableWriterJournalJsonContext.Default);
+    }
+    else
+    {
+        // Orleans 10.4 writes JSON Lines unless told otherwise. Its binary format is registered by AddJournaling, but its
+        // key has no public constant.
+        silo.Services.Configure<JournaledStateManagerOptions>(o => o.JournalFormatKey = "orleans-binary");
+    }
 });
 
 var host = builder.Build();
@@ -61,7 +86,7 @@ if (Environment.GetEnvironmentVariable("LOADTEST_STDIN_CONTROL") == "1")
     });
 }
 
-Console.WriteLine($"LoadTest silo starting (Kurrent: {connectionString}, serializer: {serializerName})...");
+Console.WriteLine($"LoadTest silo starting (Kurrent: {connectionString}, serializer: {serializerName}, journal format: {journalFormat})...");
 await host.StartAsync();
 var siloAddress = host.Services.GetRequiredService<ILocalSiloDetails>().SiloAddress;
 Console.WriteLine($"LoadTest silo is running at {siloAddress}. Press Ctrl+C to shut down.");

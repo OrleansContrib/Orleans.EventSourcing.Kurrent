@@ -11,7 +11,7 @@ using Orleans.EventSourcing.Kurrent.Hosting;
 //
 // Usage: dotnet run --project samples\LoadTest.Client -c Release -- <scenario> [options]
 //
-// Ramp options (events, reminders) — an open-loop ramp that starts at --start-rate ops/sec and
+// Ramp options (events, durable, reminders) — an open-loop ramp that starts at --start-rate ops/sec and
 // adds --step-rate every --step-seconds, reporting throughput, latency and failures per step.
 // Each operation counts towards the step that issued it; a step is judged --settle-seconds after it ends.
 //   --start-rate <n>         initial target ops/sec
@@ -32,6 +32,15 @@ using Orleans.EventSourcing.Kurrent.Hosting;
 //   --grains <n>             number of event-writer grains            (default 1000)
 //   --batch <n>              events raised per append                 (default 1)
 //   --payload <bytes>        payload size per event                   (default 64)
+//   (ramp defaults: start 200/s, +200/s every 30s)
+//
+// durable — durable state write throughput through the journaling storage provider (DurableGrain):
+//   --grains <n>             number of durable writer grains          (default 1000)
+//   --batch <n>              dictionary entries updated per write     (default 1)
+//   --slots <n>              dictionary entries per grain, so state is slots x payload (default 16)
+//   --payload <bytes>        payload size per entry                   (default 64)
+//   The silo's JOURNAL_FORMAT selects the journal format: binary (default) or json.
+//   Verification deactivates every grain, so the counts it checks are recovered from the journal.
 //   (ramp defaults: start 200/s, +200/s every 30s)
 //
 // reminders — Kurrent reminder table registration throughput, then tick delivery and lateness:
@@ -125,10 +134,11 @@ Console.WriteLine("Connected.");
 var exitCode = scenario switch
 {
     "events" => await EventsScenario.RunAsync(clusterClient, options, cancellation.Token),
+    "durable" => await DurableScenario.RunAsync(clusterClient, options, cancellation.Token),
     "reminders" => await RemindersScenario.RunAsync(clusterClient, options, cancellation.Token),
     "rolling" => await RollingScenario.RunAsync(clusterClient, options, managedSilos, siloCount, connectionString, cancellation.Token),
     "mixed" => await MixedScenario.RunAsync(clusterClient, options),
-    _ => throw new ArgumentException($"Unknown scenario '{scenario}'. Expected events, reminders, rolling or mixed."),
+    _ => throw new ArgumentException($"Unknown scenario '{scenario}'. Expected events, durable, reminders, rolling or mixed."),
 };
 
 await host.StopAsync();
