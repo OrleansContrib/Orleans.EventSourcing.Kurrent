@@ -115,16 +115,23 @@ internal sealed class KurrentJournalStorage : IJournalStorage
         }
 
         // The paged read only returns one whole version of the journal if it reached a snapshot, the first event, or the
-        // stream's own truncation point. Reaching anything else means another writer compacted or deleted the stream
-        // between pages, so the older part of this version is gone.
+        // stream's own truncation point. Reaching anything else means events this version needs are gone: either the
+        // stream's retention settings removed them, or another writer compacted or deleted the stream between pages.
         if (!foundSnapshot && oldestEventNumber > 0)
         {
-            var metadata = await client.GetStreamMetadata(streamName, cancellationToken).ConfigureAwait(false);
-            if (metadata.Metadata.TruncateBefore?.ToUInt64() != oldestEventNumber)
+            var metadata = (await client.GetStreamMetadata(streamName, cancellationToken).ConfigureAwait(false)).Metadata;
+            if (metadata.TruncateBefore?.ToUInt64() != oldestEventNumber)
             {
+                if (metadata.MaxCount.HasValue || metadata.MaxAge.HasValue)
+                {
+                    throw new InvalidOperationException(
+                        $"Journal stream '{streamName}' has lost events since its latest snapshot, starting at event {oldestEventNumber}, to its $maxCount or $maxAge stream metadata. " +
+                        "Journal streams must not set $maxCount or $maxAge.");
+                }
+
                 throw new InconsistentStateException(
                     $"Journal stream '{streamName}' was truncated by another writer while it was being read.",
-                    $"{metadata.Metadata.TruncateBefore}",
+                    $"{metadata.TruncateBefore}",
                     $"{oldestEventNumber}");
             }
         }
@@ -137,6 +144,24 @@ internal sealed class KurrentJournalStorage : IJournalStorage
 
         events.Reverse();
 
+        if (events.Count == 0)
+        {
+            consumer.Complete(metadata: null);
+        }
+        else
+        {
+            // Orleans requires a single format for the whole read. A format migration always writes a snapshot first,
+            // so everything after the latest snapshot shares one format key.
+            var formatKey = events[0].FormatKey;
+            if (events.Any(x => !string.Equals(x.FormatKey, formatKey, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException($"Journal stream '{streamName}' mixes journal format keys after its latest snapshot.");
+            }
+
+            consumer.Read(events.Select(x => x.Payload), new JournalMetadata(formatKey), complete: true);
+        }
+
+        // Only a read the consumer accepted sets the write precondition, so a failed read leaves nothing to write against.
         hasPrecondition = true;
         streamState = lastRevision;
         eventsSinceSnapshot = 0;
@@ -149,22 +174,6 @@ internal sealed class KurrentJournalStorage : IJournalStorage
                 bytesSinceSnapshot += journalEvent.Payload.Length;
             }
         }
-
-        if (events.Count == 0)
-        {
-            consumer.Complete(metadata: null);
-            return;
-        }
-
-        // Orleans requires a single format for the whole read. A format migration always writes a snapshot first,
-        // so everything after the latest snapshot shares one format key.
-        var formatKey = events[0].FormatKey;
-        if (events.Any(x => !string.Equals(x.FormatKey, formatKey, StringComparison.Ordinal)))
-        {
-            throw new InvalidOperationException($"Journal stream '{streamName}' mixes journal format keys after its latest snapshot.");
-        }
-
-        consumer.Read(events.Select(x => x.Payload), new JournalMetadata(formatKey), complete: true);
     }
 
     /// <inheritdoc/>
@@ -216,7 +225,16 @@ internal sealed class KurrentJournalStorage : IJournalStorage
     public async ValueTask DeleteAsync(CancellationToken cancellationToken)
     {
         ThrowIfNoPrecondition();
-        if (streamState != StreamState.NoStream)
+        if (streamState == StreamState.NoStream)
+        {
+            // There is nothing to delete, but the precondition still applies: another writer may have created the journal since.
+            var result = await client.ReadStreamAsync(Direction.Backwards, streamName, StreamPosition.End, 1, resolveLinkTos: false, cancellationToken).ConfigureAwait(false);
+            await foreach (var resolvedEvent in result.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                throw new InconsistentStateException($"Journal stream '{streamName}' was changed by another writer.", $"{resolvedEvent.Event.EventNumber}", $"{streamState}");
+            }
+        }
+        else
         {
             // A soft delete, so the journal can be written again later; a tombstone would prevent that.
             try

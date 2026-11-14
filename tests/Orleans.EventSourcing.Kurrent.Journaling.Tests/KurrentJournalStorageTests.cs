@@ -387,6 +387,88 @@ public sealed class KurrentJournalStorageTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task RetentionThatRemovesJournalEventsFailsTheRead()
+    {
+        var writer = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(writer);
+        for (var i = 0; i < 5; i++)
+        {
+            await writer.AppendAsync($"e{i};");
+        }
+
+        // $maxCount hides events the journal needs; that is not another writer, and the journal cannot be rebuilt.
+        await kurrent.SetStreamMetadata(streamName, StreamState.Any, new StreamMetadata(maxCount: 2), TestContext.Current.CancellationToken);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName)));
+        Assert.Contains("$maxCount", ex.Message);
+    }
+
+    [Fact]
+    public async Task RetentionThatOnlyRemovesEventsBeforeTheSnapshotReads()
+    {
+        var writer = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(writer);
+        await writer.AppendAsync("a;");
+        await writer.AppendAsync("b;");
+        await writer.AppendAsync("c;");
+        await writer.ReplaceAsync("snapshot;");
+        await writer.AppendAsync("d;");
+
+        // Keeps events 2 to 4, which still include the snapshot.
+        await kurrent.SetStreamMetadata(streamName, StreamState.Any, new StreamMetadata(maxCount: 3), TestContext.Current.CancellationToken);
+
+        Assert.Equal("snapshot;d;", (await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName))).Text);
+    }
+
+    [Fact]
+    public async Task DeleteFailsWhenAnotherWriterCreatedTheJournal()
+    {
+        var first = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(first);
+
+        var second = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(second);
+        await second.AppendAsync("theirs;");
+
+        // The first instance's precondition is "no journal", which no longer holds.
+        await Assert.ThrowsAsync<InconsistentStateException>(async () => await first.DeleteAsync(TestContext.Current.CancellationToken));
+        Assert.Equal("theirs;", (await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName))).Text);
+    }
+
+    [Fact]
+    public async Task DeleteOfMissingJournalSucceeds()
+    {
+        var storage = TestExtensions.CreateStorage(kurrent, streamName);
+        await CollectingConsumer.ReadAsync(storage);
+
+        await storage.DeleteAsync(TestContext.Current.CancellationToken);
+        await storage.AppendAsync("a;");
+
+        Assert.Equal("a;", (await CollectingConsumer.ReadAsync(TestExtensions.CreateStorage(kurrent, streamName))).Text);
+    }
+
+    [Fact]
+    public async Task FailedReadDoesNotSetThePrecondition()
+    {
+        var jsonl = TestExtensions.CreateStorage(kurrent, streamName, formatKey: "jsonl");
+        await CollectingConsumer.ReadAsync(jsonl);
+        await jsonl.AppendAsync("a;");
+
+        var binary = TestExtensions.CreateStorage(kurrent, streamName, formatKey: "binary");
+        await CollectingConsumer.ReadAsync(binary);
+        await binary.AppendAsync("b;");
+
+        // The journal mixes format keys after its latest snapshot, so it cannot be read, and so cannot be written either.
+        var reader = TestExtensions.CreateStorage(kurrent, streamName);
+        var readFailure = await Assert.ThrowsAsync<InvalidOperationException>(async () => await CollectingConsumer.ReadAsync(reader));
+        Assert.Contains("format keys", readFailure.Message);
+
+        var writeFailure = await Assert.ThrowsAsync<InvalidOperationException>(async () => await reader.AppendAsync("c;"));
+        Assert.Contains("must be read", writeFailure.Message);
+        Assert.Equal(2, (await kurrent.ReadVisibleEventsAsync(streamName)).Count);
+    }
+
+    [Fact]
     public async Task MultiStreamAppendSupportMatchesServerVersion()
     {
         Assert.SkipUnless(TestKurrent.UseRealKurrent, "Needs a real server to compare with its version.");
