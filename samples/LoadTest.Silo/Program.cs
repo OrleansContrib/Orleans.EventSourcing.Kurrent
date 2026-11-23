@@ -2,6 +2,7 @@ using KurrentDB.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Orleans.Configuration;
 using Orleans.Dashboard;
 using Orleans.EventSourcing.Kurrent.Hosting;
 using Orleans.EventSourcing.Kurrent.Reminders;
@@ -20,6 +21,10 @@ var connectionString = Environment.GetEnvironmentVariable("KURRENT_CONNECTION_ST
 // database (docker compose down -v) when switching.
 var serializerName = (Environment.GetEnvironmentVariable("GRAIN_SERIALIZER") ?? "default").ToLowerInvariant();
 
+// LOADTEST_CLUSTER_ID puts the silo in a cluster other than the default one. The contention scenario runs
+// two clusters this way, so each has its own activation of a grain, writing to the same Kurrent stream.
+var clusterId = Environment.GetEnvironmentVariable("LOADTEST_CLUSTER_ID");
+
 var clientSettings = KurrentDBClientSettings.Create(connectionString);
 
 var builder = Host.CreateApplicationBuilder(args);
@@ -30,6 +35,11 @@ builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
 builder.UseOrleans(silo =>
 {
     silo.ConfigureEndpoints(Random.Shared.Next(29170, 29998), Random.Shared.Next(29170, 29998));
+    if (clusterId is not null)
+    {
+        silo.Configure<ClusterOptions>(o => o.ClusterId = clusterId);
+    }
+
     silo.AddDashboard();
     silo.UseKurrentClustering(o => { o.ClientSettings = clientSettings; o.EventCountBeforeSnapshot = 50; });
     //silo.UseLocalhostClustering();
@@ -61,7 +71,7 @@ if (Environment.GetEnvironmentVariable("LOADTEST_STDIN_CONTROL") == "1")
     });
 }
 
-Console.WriteLine($"LoadTest silo starting (Kurrent: {connectionString}, serializer: {serializerName})...");
+Console.WriteLine($"LoadTest silo starting (Kurrent: {connectionString}, serializer: {serializerName}, cluster: {clusterId ?? "default"})...");
 await host.StartAsync();
 var siloAddress = host.Services.GetRequiredService<ILocalSiloDetails>().SiloAddress;
 Console.WriteLine($"LoadTest silo is running at {siloAddress}. Press Ctrl+C to shut down.");

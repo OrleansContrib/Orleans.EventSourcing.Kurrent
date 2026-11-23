@@ -9,6 +9,7 @@ namespace Orleans.EventSourcing.Kurrent.Storage;
 internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdaptor<TLogView, TLogEntry>, IDisposable, IAsyncDisposable where TLogView : new()
 {
     readonly ILogViewAdaptorHost<TLogView, TLogEntry> host;
+    readonly ILogConsistencyProtocolServices services;
     readonly CommandContext context;
     readonly CancellationTokenSource disposeCts = new();
 
@@ -21,9 +22,14 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     bool writeRejected;
     bool disposed;
 
+    // Batches taken out of the suffix without being written. Each write records the count when it is
+    // queued and is refused if it has changed by the time the write runs (see ObserveWriteAsync).
+    long droppedBatches;
+
     public KurrentLogViewAdapter(ILogViewAdaptorHost<TLogView, TLogEntry> host, IKurrentClient client, IEventConverter<TLogEntry> eventConverter, ILogConsistencyProtocolServices services, IKurrentStreamNameProvider streamNameProvider, KurrentMetrics metrics, KurrentRetryPolicy retry)
     {
         this.host = host;
+        this.services = services;
         this.context = new CommandContext
         {
             Client = client,
@@ -253,7 +259,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
         // pendingSuffix already contains this batch, so subtract it back out.
         var expectedVersion = ConfirmedVersion + pendingSuffix.Count - batch.Length;
-        observationTail = ObserveWriteAsync(observationTail, batch, expectedVersion);
+        observationTail = ObserveWriteAsync(observationTail, batch, expectedVersion, droppedBatches);
     }
 
     /// <summary>
@@ -264,14 +270,38 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     /// conditional append). Never throws: failures are recorded and surfaced by
     /// <see cref="ObservePendingWritesAsync"/>.
     /// </summary>
-    private async Task ObserveWriteAsync(Task previous, TLogEntry[] batch, int expectedVersion)
+    /// <remarks>
+    /// <para>
+    /// A write is refused without being sent if any batch queued before it was dropped (rejected,
+    /// refused or failed) after it was queued. It was decided on a tentative view that included
+    /// that batch, and its expected version counts it. If another writer appended exactly as many
+    /// events, that version would match and the write would be stored in their place. Everything
+    /// queued before a write runs before it, so any batch dropped in the meantime is one of those.
+    /// <paramref name="droppedBefore"/> is the count of dropped batches when the write was queued.
+    /// A reload between them does not make the write safe: it was still decided before the reload.
+    /// </para>
+    /// <para>
+    /// Once a write is rejected, every write after it is also refused until a reload or clear, like
+    /// the Orleans reference adaptor's handling of stale conditional updates.
+    /// </para>
+    /// </remarks>
+    private async Task ObserveWriteAsync(Task previous, TLogEntry[] batch, int expectedVersion, long droppedBefore)
     {
         await previous.ConfigureAwait(true); // never faults
 
         if (disposed)
         {
             // The adapter is being disposed; the write never happened.
-            RemoveFromSuffix(batch.Length);
+            DropFromSuffix(batch.Length);
+            return;
+        }
+
+        if (writeRejected || droppedBatches != droppedBefore)
+        {
+            // Refused for the reasons above; reported like a rejection.
+            writeRejected = true;
+            DropFromSuffix(batch.Length);
+            RebuildTentativeView();
             return;
         }
 
@@ -284,7 +314,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         catch (OperationCanceledException)
         {
             // The adapter is being disposed; the write never happened.
-            RemoveFromSuffix(batch.Length);
+            DropFromSuffix(batch.Length);
             return;
         }
 #pragma warning disable CA1031 // Do not catch general exception types
@@ -295,7 +325,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
             // writes until a successful load or clear re-establishes a known state.
             streamFault ??= ex;
             (writeFailures ??= []).Add(ex);
-            RemoveFromSuffix(batch.Length);
+            DropFromSuffix(batch.Length);
             return;
         }
 
@@ -307,7 +337,49 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         else
         {
             writeRejected = true;
-            RemoveFromSuffix(batch.Length);
+            DropFromSuffix(batch.Length);
+            RebuildTentativeView();
+        }
+    }
+
+    /// <summary>
+    /// Recomputes <see cref="TentativeView"/> from a copy of <see cref="ConfirmedView"/> and the
+    /// entries still pending, so entries that were rejected or refused no longer show in it.
+    /// The copy comes from <see cref="ILogConsistencyProtocolServices.DeepCopy{T}"/>, as in the
+    /// Orleans reference adaptor. If the view can't be copied (no copier for its type, or the
+    /// copier returns the same instance), the tentative view is left as it is until the next
+    /// reload or clear, which rebuilds it anyway, rather than failing the observation chain.
+    /// </summary>
+    private void RebuildTentativeView()
+    {
+        try
+        {
+            var tentative = services.DeepCopy(ConfirmedView);
+            if (ReferenceEquals(tentative, ConfirmedView))
+            {
+                // Applying entries to it would change the confirmed view.
+                services.Log(Microsoft.Extensions.Logging.LogLevel.Warning, "Copying {0} returned the same instance, so the tentative view still includes entries that were not written. It is rebuilt on the next reload.", typeof(TLogView));
+                return;
+            }
+
+            foreach (var entry in pendingSuffix)
+            {
+                if (IsDeletePriorEventsMarker(entry))
+                {
+                    tentative = new TLogView();
+                }
+
+                host.UpdateView(tentative, entry);
+            }
+
+            TentativeView = tentative;
+            host.OnViewChanged(true, false);
+        }
+#pragma warning disable CA1031 // Do not catch general exception types
+        catch (Exception ex)
+#pragma warning restore CA1031 // Logged; the views are rebuilt on the next reload or clear
+        {
+            services.CaughtException(nameof(RebuildTentativeView), ex);
         }
     }
 
@@ -317,7 +389,8 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
     /// A rejection means the grain's view of the stream version is stale and the true stream
     /// state is unknown, so <see cref="writeRejected"/> is left set until a reload
     /// (<see cref="Synchronize"/>/<see cref="ClearLogAsync"/>) re-establishes a known state;
-    /// every call made in the meantime keeps reporting the rejection.
+    /// every call made in the meantime keeps reporting the rejection, and every write is refused
+    /// without being sent (see <see cref="ObserveWriteAsync"/>).
     /// </summary>
     private async Task<bool> ObservePendingWritesAsync()
     {
@@ -422,6 +495,13 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
         }
 
         RemoveFromSuffix(batch.Length);
+    }
+
+    /// <summary>Removes a batch that was not written, so the writes queued behind it are refused.</summary>
+    private void DropFromSuffix(int count)
+    {
+        RemoveFromSuffix(count);
+        droppedBatches++;
     }
 
     private void RemoveFromSuffix(int count)
@@ -579,7 +659,7 @@ internal sealed class KurrentLogViewAdapter<TLogView, TLogEntry> : ILogViewAdapt
 
     /// <summary>
     /// Rebuilds the confirmed view by replaying the stream, honouring truncation markers and
-    /// healing unset $tb metadata. Builds two identical views so the adapter does not need a
+    /// healing unset $tb metadata. Builds two identical views so loading does not need a
     /// deep copier for <typeparamref name="TLogView"/>.
     /// </summary>
     private static async Task<LoadResult> LoadAsync(CommandContext context, CancellationToken token)
