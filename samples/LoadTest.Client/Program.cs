@@ -3,6 +3,7 @@ using LoadTest.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Orleans.Configuration;
 using Orleans.EventSourcing.Kurrent.Hosting;
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,16 @@ using Orleans.EventSourcing.Kurrent.Hosting;
 //   --silo-path <dll>        LoadTest.Silo.dll to run                 (default: the sibling build)
 //   --log-dir <dir>          where silo logs go                       (default loadtest-logs/<timestamp>)
 //
+// contention — two clusters with their own silos write to the same grains' streams, so conditional writes
+// reject each other; then every stream is checked for writes stored after a rejected one, rejected writes
+// that were stored, and acknowledged writes that are missing. Fails if nothing was rejected.
+//   --silos <n>              silos in each cluster                    (default 1)
+//   --grains <n>             grains both clusters write to            (default 20)
+//   --workers <n>            concurrent writers in each cluster       (default 64)
+//   --duration <seconds>     duration of the load                     (default 60)
+//   --report-interval <s>    timeline row interval                    (default 5)
+//   --silo-path/--log-dir    as for rolling
+//
 // mixed (default) — closed-loop deposits/withdrawals/reads/reminder churn on account grains:
 //   --grains <n>             number of event-sourced account grains   (default 10000)
 //   --workers <n>            number of concurrent client workers      (default 32)
@@ -94,9 +105,11 @@ Console.CancelKeyPress += (_, e) =>
     }
 };
 
-// The rolling scenario runs its own silos (unless --external-silos), so they must be up before the client connects.
-var siloCount = options.GetInt("silos", 3);
-await using var managedSilos = scenario == "rolling" && !options.Has("external-silos")
+// The rolling and contention scenarios run their own silos (rolling unless --external-silos), so they must
+// be up before the client connects. Contention runs --silos in each of its two clusters.
+var contention = scenario == "contention";
+var siloCount = options.GetInt("silos", contention ? 1 : 3);
+await using var managedSilos = contention || (scenario == "rolling" && !options.Has("external-silos"))
     ? new SiloProcessManager(
         options.GetString("silo-path") ?? SiloProcessManager.DefaultSiloPath(),
         connectionString,
@@ -104,18 +117,36 @@ await using var managedSilos = scenario == "rolling" && !options.Has("external-s
     : null;
 if (managedSilos is not null)
 {
-    Console.WriteLine($"Starting {siloCount} silos...");
-    for (var i = 0; i < siloCount; i++)
+    string?[] clusters = contention ? [ContentionScenario.ClusterA, ContentionScenario.ClusterB] : [null];
+    foreach (var clusterId in clusters)
     {
-        var silo = await managedSilos.StartAsync(cancellation.Token);
-        Console.WriteLine($"  {silo} running");
+        Console.WriteLine($"Starting {siloCount} silos{(clusterId is null ? "" : $" in {clusterId}")}...");
+        for (var i = 0; i < siloCount; i++)
+        {
+            var silo = await managedSilos.StartAsync(cancellation.Token, clusterId);
+            Console.WriteLine($"  {silo} running");
+        }
+    }
+
+    if (contention)
+    {
+        // The rolling scenario reports this itself.
+        Console.WriteLine($"Silo logs: {managedSilos.LogDirectory}");
     }
 }
 
 var builder = Host.CreateApplicationBuilder();
 builder.Logging.AddFilter("Orleans", LogLevel.Warning);
 builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
-builder.UseOrleansClient(client => client.UseKurrentClustering(x => x.ClientSettings = KurrentDBClientSettings.Create(connectionString)));
+builder.UseOrleansClient(client =>
+{
+    if (contention)
+    {
+        client.Configure<ClusterOptions>(o => o.ClusterId = ContentionScenario.ClusterA);
+    }
+
+    client.UseKurrentClustering(x => x.ClientSettings = KurrentDBClientSettings.Create(connectionString));
+});
 
 using var host = builder.Build();
 await host.StartAsync();
@@ -127,8 +158,9 @@ var exitCode = scenario switch
     "events" => await EventsScenario.RunAsync(clusterClient, options, cancellation.Token),
     "reminders" => await RemindersScenario.RunAsync(clusterClient, options, cancellation.Token),
     "rolling" => await RollingScenario.RunAsync(clusterClient, options, managedSilos, siloCount, connectionString, cancellation.Token),
+    "contention" => await ContentionScenario.RunAsync(clusterClient, options, connectionString, cancellation.Token),
     "mixed" => await MixedScenario.RunAsync(clusterClient, options),
-    _ => throw new ArgumentException($"Unknown scenario '{scenario}'. Expected events, reminders, rolling or mixed."),
+    _ => throw new ArgumentException($"Unknown scenario '{scenario}'. Expected events, reminders, rolling, contention or mixed."),
 };
 
 await host.StopAsync();

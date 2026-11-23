@@ -439,10 +439,14 @@ public sealed class BasicTests : IAsyncLifetime
 
         Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
         Assert.False(await account.Withdraw(66, TestContext.Current.CancellationToken));
-        Assert.Equal(34, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
+
+        // The rejected withdrawal is rolled back from the tentative state (issue #16)
+        Assert.Equal(100, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
         Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
+
+        // Refused without being sent until the grain resynchronizes
         Assert.False(await account.Withdraw(33, TestContext.Current.CancellationToken));
-        Assert.Equal(1, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
+        Assert.Equal(100, await account.GetTentativeBalance(TestContext.Current.CancellationToken));
         Assert.Equal(100, await account.GetConfirmedBalance(TestContext.Current.CancellationToken));
 
         await Assert.ThrowsAsync<InconsistentStateException>(async () => { await account.Deposit(11, TestContext.Current.CancellationToken); }); // causes grain restart

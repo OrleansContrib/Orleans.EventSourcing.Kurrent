@@ -36,7 +36,8 @@ internal sealed partial class SiloProcessManager(string siloDllPath, string conn
         return Path.GetFullPath(Path.Combine(baseDirectory.FullName, "..", "..", "..", "..", "LoadTest.Silo", "bin", configuration, targetFramework, "LoadTest.Silo.dll"));
     }
 
-    public async Task<ManagedSilo> StartAsync(CancellationToken cancellationToken)
+    /// <param name="clusterId">The cluster the silo joins, or null for the default one.</param>
+    public async Task<ManagedSilo> StartAsync(CancellationToken cancellationToken, string? clusterId = null)
     {
         if (!File.Exists(siloDllPath))
         {
@@ -45,7 +46,7 @@ internal sealed partial class SiloProcessManager(string siloDllPath, string conn
 
         Directory.CreateDirectory(logDirectory);
         var id = Interlocked.Increment(ref nextId);
-        var logPath = Path.Combine(logDirectory, $"silo-{id}.log");
+        var logPath = Path.Combine(logDirectory, clusterId is null ? $"silo-{id}.log" : $"silo-{id}-{clusterId}.log");
         var startInfo = new ProcessStartInfo("dotnet")
         {
             ArgumentList = { siloDllPath },
@@ -57,6 +58,10 @@ internal sealed partial class SiloProcessManager(string siloDllPath, string conn
         };
         startInfo.Environment["KURRENT_CONNECTION_STRING"] = connectionString;
         startInfo.Environment["LOADTEST_STDIN_CONTROL"] = "1";
+        if (clusterId is not null)
+        {
+            startInfo.Environment["LOADTEST_CLUSTER_ID"] = clusterId;
+        }
 
         var silo = new ManagedSilo(id, logPath, Process.Start(startInfo)!);
         lock (silos)

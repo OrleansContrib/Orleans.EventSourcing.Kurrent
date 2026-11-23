@@ -201,9 +201,9 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 // The conditional append is rejected because the expected version is stale.
                 Assert.False(await adapter.TryAppend(new Applied(50)));
 
-                // Until the log is resynchronized the views are diverged: the tentative view still
-                // contains the rejected entry and the confirmed view is missing the external write.
-                Assert.Equal(150, adapter.TentativeView.Balance);
+                // The rejected entry is rolled back from the tentative view; until the log is
+                // resynchronized both views are missing the external write.
+                Assert.Equal(100, adapter.TentativeView.Balance);
                 Assert.Equal(100, adapter.ConfirmedView.Balance);
                 Assert.Equal(1, adapter.ConfirmedVersion);
 
@@ -269,6 +269,404 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 adapter.Dispose();
                 await client.DisposeAsync();
             }
+        }
+
+        // Issue #16: a write queued behind a rejected one expects a version that counts the
+        // rejected entries. If another writer appended as many events, that version matches.
+        [Fact]
+        public async Task ConditionalWritesQueuedBehindARejectedWriteAreNotSent()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var inner = new InMemoryKurrentClient();
+            var blocking = new BlockingKurrentClient(inner);
+            var serializer = new TestEventSerializer();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var adapter = CreateAdapter(blocking, services, streamNameProvider, serializer);
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                blocking.BlockNextAppend();
+                var first = adapter.TryAppend(new Applied(10));
+                await blocking.WaitForAppendToStart();
+
+                // Decided on the tentative view, which includes the first write
+                var second = adapter.TryAppend(new Applied(20));
+                Assert.Equal(130, adapter.TentativeView.Balance);
+
+                // Another writer appends one event while the first write is in flight
+                await AppendExternallyAsync(inner, serializer, streamName, 0, 7);
+                blocking.ReleaseAppend();
+
+                Assert.False(await first);
+                Assert.False(await second);
+
+                // The second write did not take the first one's place
+                Assert.Equal(new[] { 100, 7 }, await ReadAmountsAsync(inner, serializer, streamName));
+                Assert.Equal(100, adapter.ConfirmedView.Balance);
+                Assert.Equal(100, adapter.TentativeView.Balance);
+                Assert.Equal(1, adapter.ConfirmedVersion);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+
+                await adapter.Synchronize();
+                Assert.True(await adapter.TryAppend(new Applied(20)));
+                Assert.Equal(127, adapter.ConfirmedView.Balance);
+                Assert.Equal(127, adapter.TentativeView.Balance);
+                Assert.Equal(new[] { 100, 7, 20 }, await ReadAmountsAsync(inner, serializer, streamName));
+            }
+            finally
+            {
+                adapter.Dispose();
+                await inner.DisposeAsync();
+            }
+        }
+
+        // The same as above through RaiseEvent and ConfirmEvents, which needs no reentrancy
+        [Fact]
+        public async Task SubmittedWritesQueuedBehindARejectedWriteAreNotSent()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var inner = new InMemoryKurrentClient();
+            var blocking = new BlockingKurrentClient(inner);
+            var serializer = new TestEventSerializer();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var adapter = CreateAdapter(blocking, services, streamNameProvider, serializer);
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                blocking.BlockNextAppend();
+                adapter.Submit(new Applied(1));
+                await blocking.WaitForAppendToStart();
+                adapter.SubmitRange([new Applied(2), new Applied(3)]);
+                adapter.Submit(new Applied(4));
+
+                // Exactly as many events as the first write, so the next one would line up
+                await AppendExternallyAsync(inner, serializer, streamName, 0, 7);
+                blocking.ReleaseAppend();
+
+                await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ConfirmSubmittedEntries());
+
+                Assert.Equal(new[] { 100, 7 }, await ReadAmountsAsync(inner, serializer, streamName));
+                Assert.Equal(100, adapter.ConfirmedView.Balance);
+                Assert.Equal(100, adapter.TentativeView.Balance);
+                Assert.Equal(1, adapter.ConfirmedVersion);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+            }
+            finally
+            {
+                adapter.Dispose();
+                await inner.DisposeAsync();
+            }
+        }
+
+        // A reload clears the rejection, but a write queued behind the reload can still count a write
+        // ahead of it that is then rejected. Found by the load test's contention scenario.
+        [Fact]
+        public Task AWriteQueuedBehindAReloadIsNotSentWhenAWriteItCountedIsRejected() => RunOnGrainLikeSchedulerAsync(async () =>
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var inner = new InMemoryKurrentClient();
+            var blocking = new BlockingKurrentClient(inner);
+            var serializer = new TestEventSerializer();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var adapter = CreateAdapter(blocking, services, streamNameProvider, serializer);
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+
+                var firstGate = blocking.BlockNextAppend();
+                var first = adapter.TryAppend(new Applied(10));
+                await firstGate.Started;
+
+                // Waits for the first write, then queues a reload behind whatever is queued by then
+                var synchronize = adapter.Synchronize();
+                var secondGate = blocking.BlockNextAppend();
+                var second = adapter.TryAppend(new Applied(20));
+
+                firstGate.Release();
+                Assert.True(await first);
+                await secondGate.Started;
+                await DrainAsync();
+
+                // Queued behind the reload, and decided on a tentative view that includes the second write
+                var third = adapter.TryAppend(new Applied(30));
+                Assert.Equal(160, adapter.TentativeView.Balance);
+
+                // Another writer appends one event while the second write is in flight
+                await AppendExternallyAsync(inner, serializer, streamName, 1, 7);
+                secondGate.Release();
+
+                Assert.False(await second);
+                await synchronize;
+                Assert.False(await third);
+
+                // The third write did not take the second one's place
+                Assert.Equal(new[] { 100, 10, 7 }, await ReadAmountsAsync(inner, serializer, streamName));
+                Assert.Equal(117, adapter.ConfirmedView.Balance);
+                Assert.Equal(117, adapter.TentativeView.Balance);
+                Assert.Equal(3, adapter.ConfirmedVersion);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+            }
+            finally
+            {
+                adapter.Dispose();
+                await inner.DisposeAsync();
+            }
+        });
+
+        [Fact]
+        public async Task WritesAfterARejectionAreRefusedWithoutBeingSentUntilResynchronized()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+            var serializer = new TestEventSerializer();
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+                await AppendExternallyAsync(client, serializer, streamName, 0, 7);
+                Assert.False(await adapter.TryAppend(new Applied(50)));
+
+                // Fails anything that reaches Kurrent, so a write that was sent would throw
+                client.AddExceptionToThrowForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "sent")), int.MaxValue);
+
+                Assert.False(await adapter.TryAppend(new Applied(1)));
+                Assert.False(await adapter.TryAppendRange([new Applied(2), new Applied(3)]));
+
+                // With nothing ahead of it, a raised entry is refused and rolled back as it is submitted
+                adapter.Submit(new Applied(5));
+                Assert.Equal(100, adapter.TentativeView.Balance);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+                await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ConfirmSubmittedEntries());
+
+                client.ClearExceptionForTesting(streamName);
+                await adapter.Synchronize();
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+                Assert.Equal(108, adapter.ConfirmedView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task ARejectionStillReportsFalseWhenTheViewCannotBeCopied(bool copierThrows)
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices
+            {
+                Copier = copierThrows ? static _ => throw new InvalidOperationException("no copier") : static value => value,
+            };
+            var client = new InMemoryKurrentClient();
+            var serializer = new TestEventSerializer();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var adapter = CreateAdapter(client, services, streamNameProvider, serializer);
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+                await AppendExternallyAsync(client, serializer, streamName, 0, 7);
+
+                Assert.False(await adapter.TryAppend(new Applied(50)));
+
+                // The tentative view is left as it was; the confirmed view is untouched
+                Assert.Equal(150, adapter.TentativeView.Balance);
+                Assert.Equal(100, adapter.ConfirmedView.Balance);
+                Assert.Equal(copierThrows ? 1 : 0, services.CaughtExceptions.Count);
+
+                await adapter.Synchronize();
+                Assert.Equal(107, adapter.TentativeView.Balance);
+                Assert.Equal(107, adapter.ConfirmedView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+                await client.DisposeAsync();
+            }
+        }
+
+        // Scenarios below are adapted from the Orleans reference adaptor's tests
+        // (dotnet/orleans, test/Orleans.EventSourcing.Tests/EventSourcingTests/PrimaryBasedLogViewAdaptorTests.cs, MIT).
+
+        [Fact]
+        public async Task TryAppendRangeIsRejectedAsAWholeAndLeavesNothingTentative()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var client = new InMemoryKurrentClient();
+            var serializer = new TestEventSerializer();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var adapter = CreateAdapter(client, services, streamNameProvider, serializer);
+
+            try
+            {
+                Assert.True(await adapter.TryAppend(new Applied(100)));
+                await AppendExternallyAsync(client, serializer, streamName, 0, 7);
+
+                Assert.False(await adapter.TryAppendRange([new Applied(1), new Applied(2), new Applied(3)]));
+
+                Assert.Equal(new[] { 100, 7 }, await ReadAmountsAsync(client, serializer, streamName));
+                Assert.Empty(adapter.UnconfirmedSuffix);
+                Assert.Equal(1, adapter.ConfirmedVersion);
+                Assert.Equal(adapter.ConfirmedView.Balance, adapter.TentativeView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+                await client.DisposeAsync();
+            }
+        }
+
+        [Fact]
+        public async Task TryAppendRangeWithAnEmptyRangeSucceedsWithoutTouchingKurrent()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                // Fails anything that reaches Kurrent
+                client.AddExceptionToThrowForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "sent")), int.MaxValue);
+
+                Assert.True(await adapter.TryAppendRange([]));
+                Assert.Equal(0, adapter.ConfirmedVersion);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task TryAppendRangeEnumeratesOnceAndKeepsOrder()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var client = new InMemoryKurrentClient();
+            var serializer = new TestEventSerializer();
+            var streamName = streamNameProvider.GetStreamName(services.GrainId);
+            var adapter = CreateAdapter(client, services, streamNameProvider, serializer);
+
+            try
+            {
+                var entries = new SingleUseEnumerable<TestLogEntry>([new Applied(1), new Applied(2), new Applied(3)]);
+
+                Assert.True(await adapter.TryAppendRange(entries));
+
+                Assert.Equal(1, entries.EnumerationCount);
+                Assert.Equal(new[] { 1, 2, 3 }, await ReadAmountsAsync(client, serializer, streamName));
+                Assert.Equal(3, adapter.ConfirmedVersion);
+            }
+            finally
+            {
+                adapter.Dispose();
+                await client.DisposeAsync();
+            }
+        }
+
+        [Fact]
+        public async Task SynchronizeDuringABlockedWriteWaitsForTheWriteThenReads()
+        {
+            var streamNameProvider = new KurrentStreamName();
+            var services = new TestLogConsistencyProtocolServices();
+            var blocking = new BlockingKurrentClient(new InMemoryKurrentClient());
+            var adapter = CreateAdapter(blocking, services, streamNameProvider);
+
+            try
+            {
+                blocking.BlockNextAppend();
+                adapter.Submit(new Applied(5));
+                await blocking.WaitForAppendToStart();
+
+                var synchronize = adapter.Synchronize();
+                await Task.Delay(50, TestContext.Current.CancellationToken);
+                Assert.False(synchronize.IsCompleted);
+
+                blocking.ReleaseAppend();
+                await synchronize;
+
+                Assert.Equal(1, adapter.ConfirmedVersion);
+                Assert.Equal(5, adapter.ConfirmedView.Balance);
+                Assert.Equal(5, adapter.TentativeView.Balance);
+                Assert.Empty(adapter.UnconfirmedSuffix);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        [Fact]
+        public async Task AFailedClearPropagatesAndKeepsBothViews()
+        {
+            var (adapter, client, streamName) = CreateLeaderChangeAdapter();
+
+            try
+            {
+                Assert.True(await adapter.TryAppendRange([new Applied(100), new Applied(5)]));
+
+                client.AddExceptionToThrowOnceForTesting(streamName, new RpcException(new Status(StatusCode.DeadlineExceeded, "deadline")));
+                await Assert.ThrowsAsync<InconsistentStateException>(() => adapter.ClearLogAsync(TestContext.Current.CancellationToken));
+
+                Assert.Equal(2, adapter.ConfirmedVersion);
+                Assert.Equal(105, adapter.ConfirmedView.Balance);
+                Assert.Equal(105, adapter.TentativeView.Balance);
+
+                // The stream was not deleted, so it can still be written to
+                Assert.True(await adapter.TryAppend(new Applied(1)));
+                Assert.Equal(106, adapter.ConfirmedView.Balance);
+            }
+            finally
+            {
+                adapter.Dispose();
+            }
+        }
+
+        private static async Task AppendExternallyAsync(IKurrentClient client, TestEventSerializer serializer, string streamName, ulong expectedRevision, int amount)
+        {
+            var result = await client.ConditionalAppendToStreamAsync(streamName,
+                                                                     StreamState.StreamRevision(expectedRevision),
+                                                                     [serializer.SerializeEvent(new Applied(amount))],
+                                                                     TestContext.Current.CancellationToken);
+            Assert.Equal(ConditionalWriteStatus.Succeeded, result.Status);
+        }
+
+        private static async Task<int[]> ReadAmountsAsync(IKurrentClient client, TestEventSerializer serializer, string streamName)
+        {
+            var ct = TestContext.Current.CancellationToken;
+            var amounts = new List<int>();
+            await foreach (var resolved in await client.ReadStreamAsync(Direction.Forwards, streamName, StreamPosition.Start, int.MaxValue, false, ct))
+            {
+                amounts.Add(((Applied)serializer.DeserializeEvent(resolved)).Amount);
+            }
+
+            return [.. amounts];
+        }
+
+        private sealed class SingleUseEnumerable<T>(IEnumerable<T> values) : IEnumerable<T>
+        {
+            public int EnumerationCount { get; private set; }
+
+            public IEnumerator<T> GetEnumerator()
+            {
+                if (++EnumerationCount > 1)
+                {
+                    throw new InvalidOperationException("Enumerated more than once.");
+                }
+
+                return values.GetEnumerator();
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
         }
 
         [Fact]
@@ -769,7 +1167,12 @@ namespace Orleans.EventSourcing.Kurrent.Tests
 
             public string MyClusterId => "test-cluster";
 
-            public T DeepCopy<T>(T value) => value;
+            // Copies views the way the Orleans copier would; a test can replace it
+            public Func<object, object> Copier { get; set; } = static value => value is TestView view ? new TestView { Balance = view.Balance } : value;
+
+            public List<Exception> CaughtExceptions { get; } = [];
+
+            public T DeepCopy<T>(T value) => (T)Copier(value!);
 
             public void ProtocolError(string message, bool throwException)
             {
@@ -779,9 +1182,7 @@ namespace Orleans.EventSourcing.Kurrent.Tests
                 }
             }
 
-            public void CaughtException(string message, Exception exception)
-            {
-            }
+            public void CaughtException(string message, Exception exception) => CaughtExceptions.Add(exception);
 
             public void CaughtUserCodeException(string message, string where, Exception exception)
             {
@@ -794,33 +1195,35 @@ namespace Orleans.EventSourcing.Kurrent.Tests
 
         private sealed class BlockingKurrentClient(IKurrentClient inner) : IKurrentClient
         {
-            private TaskCompletionSource appendStarted = CreateSignal();
-            private TaskCompletionSource releaseAppend = CreateSignal();
-            private volatile bool blockNextAppend;
+            // One gate per append to block, in the order the appends arrive
+            private readonly System.Collections.Concurrent.ConcurrentQueue<AppendGate> gates = new();
+            private AppendGate latest = new();
 
             public TimeSpan ReadDelay { get; set; }
 
-            public void BlockNextAppend()
+            /// <summary>Blocks the next append that is not already blocked, until its gate is released.</summary>
+            public AppendGate BlockNextAppend()
             {
-                appendStarted = CreateSignal();
-                releaseAppend = CreateSignal();
-                blockNextAppend = true;
+                var gate = new AppendGate();
+                latest = gate;
+                gates.Enqueue(gate);
+                return gate;
             }
 
-            public Task WaitForAppendToStart() => appendStarted.Task;
+            /// <summary>Waits for the append blocked by the latest <see cref="BlockNextAppend"/>.</summary>
+            public Task WaitForAppendToStart() => latest.Started;
 
-            public void ReleaseAppend() => releaseAppend.TrySetResult();
+            /// <summary>Releases the append blocked by the latest <see cref="BlockNextAppend"/>.</summary>
+            public void ReleaseAppend() => latest.Release();
 
             public async Task<ConditionalWriteResult> ConditionalAppendToStreamAsync(string streamName,
                                                                                      StreamState expectedRevision,
                                                                                      IEnumerable<EventData> eventData,
                                                                                      CancellationToken cancellationToken)
             {
-                if (blockNextAppend)
+                if (gates.TryDequeue(out var gate))
                 {
-                    blockNextAppend = false;
-                    appendStarted.TrySetResult();
-                    await releaseAppend.Task.WaitAsync(cancellationToken);
+                    await gate.Enter(cancellationToken);
                 }
 
                 return await inner.ConditionalAppendToStreamAsync(streamName, expectedRevision, eventData, cancellationToken);
@@ -850,9 +1253,39 @@ namespace Orleans.EventSourcing.Kurrent.Tests
             public void Dispose() => inner.Dispose();
 
             public ValueTask DisposeAsync() => inner.DisposeAsync();
+        }
 
-            private static TaskCompletionSource CreateSignal()
-                => new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private sealed class AppendGate
+        {
+            private readonly TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly TaskCompletionSource released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            /// <summary>Completes when the blocked append reaches the client.</summary>
+            public Task Started => started.Task;
+
+            public void Release() => released.TrySetResult();
+
+            public Task Enter(CancellationToken cancellationToken)
+            {
+                started.TrySetResult();
+                return released.Task.WaitAsync(cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="test"/> on a scheduler that runs one task at a time, as a grain's does, so the
+        /// adapter's continuations resume on it in a fixed order and <see cref="DrainAsync"/> can let them run.
+        /// </summary>
+        private static Task RunOnGrainLikeSchedulerAsync(Func<Task> test)
+            => Task.Factory.StartNew(test, CancellationToken.None, TaskCreationOptions.None, new ConcurrentExclusiveSchedulerPair().ExclusiveScheduler).Unwrap();
+
+        /// <summary>Lets everything already queued on the scheduler from <see cref="RunOnGrainLikeSchedulerAsync"/> run.</summary>
+        private static async Task DrainAsync()
+        {
+            for (var i = 0; i < 20; i++)
+            {
+                await Task.Yield();
+            }
         }
 
         private sealed class TestEventSerializer : IEventConverter<TestLogEntry>
